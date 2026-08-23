@@ -78,8 +78,15 @@ export default function LoginPage() {
     }
   };
 
+  const isDevMode = process.env.NODE_ENV !== 'production' && process.env.NEXT_PUBLIC_DEV_WALLET;
+  
   return (
-    <div className="min-h-screen bg-gray-950 flex items-center justify-center p-4">
+    <div className="min-h-screen bg-gray-950 flex flex-col items-center justify-center p-4">
+      {isDevMode && (
+        <div className="w-full max-w-md bg-red-600 text-white text-center py-2 font-bold mb-4 rounded-xl shadow-lg border border-red-500">
+          ⚠️ DEV MODE: FALLBACK WALLET ACTIVE
+        </div>
+      )}
       <div className="w-full max-w-md">
         <div className="text-center mb-8">
           <img
@@ -200,11 +207,11 @@ async function getWalletAddress(type: WalletType): Promise<string | null> {
     // NEXT_PUBLIC_AUTH_DEV_MODE=true (Vercel test deployments). The gateway
     // also requires AUTH_DEV_MODE=true to accept dev signatures.
     if (
-      process.env.NODE_ENV === 'development' ||
-      process.env.NEXT_PUBLIC_AUTH_DEV_MODE === 'true'
+      process.env.NODE_ENV !== 'production' &&
+      process.env.NEXT_PUBLIC_DEV_WALLET
     ) {
       console.warn(`[x402] No ${type} wallet extension detected. Using dev mode address.`);
-      return 'GA5ZSE6VKPVFLEXMWJQBGHE4FJHKQIFSJMLQ7H4VFQB4UHLEH5IOVK3F';
+      return process.env.NEXT_PUBLIC_DEV_WALLET;
     }
 
     return null;
@@ -238,8 +245,8 @@ async function signChallenge(
     // Dev fallback: return a mock signature when no wallet extension is
     // detected. Enabled in local dev OR when NEXT_PUBLIC_AUTH_DEV_MODE=true.
     if (
-      process.env.NODE_ENV === 'development' ||
-      process.env.NEXT_PUBLIC_AUTH_DEV_MODE === 'true'
+      process.env.NODE_ENV !== 'production' &&
+      process.env.NEXT_PUBLIC_DEV_WALLET
     ) {
       console.warn(`[x402] No ${type} wallet for signing. Using dev mode signature.`);
       return Buffer.from(`dev-sig-${address}-${Date.now()}`, 'utf-8').toString('base64');
