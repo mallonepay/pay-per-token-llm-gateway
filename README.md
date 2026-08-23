@@ -22,7 +22,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Stellar-Testnet-green" alt="Stellar Testnet" />
+  <img src="https://img.shields.io/badge/Stellar-Mainnet%20%7C%20Testnet-green" alt="Stellar Mainnet & Testnet" />
   <img src="https://img.shields.io/badge/NestJS-10.x-red" alt="NestJS" />
   <img src="https://img.shields.io/badge/Next.js-14.x-black" alt="Next.js" />
   <img src="https://img.shields.io/badge/Soroban-Rust-orange" alt="Soroban Rust" />
@@ -298,6 +298,14 @@ curl -X POST http://localhost:3000/api/v1/chat/completions \
   }'
 ```
 
+### 🌐 Networks
+
+The gateway supports both `testnet` and `mainnet` via the `STELLAR_NETWORK` environment variable. When deploying to `mainnet`, ensure you update the following variables to their production counterparts:
+- `STELLAR_NETWORK=mainnet`
+- `NETWORK_PASSPHRASE="Public Global Stellar Network ; September 2015"`
+- The gateway will automatically configure the correct network-aware USDC issuer.
+- Use production-grade RPC nodes for `HORIZON_URL` and `SOROBAN_RPC_URL`.
+
 ### Environment Files
 
 - The gateway loads a `.env` file from the repository root on startup (via `@x402/config`). This is what makes `cp .env.example .env` work — no manual `export` is needed for `pnpm dev:gateway`, `pnpm exec nx start gateway`, or the Docker image (as long as the file is present).
@@ -571,7 +579,7 @@ See [DEPLOYMENT.md](./DEPLOYMENT.md) for the complete step-by-step guide.
 
 ### 💡 v3 — Planned
 
-- [ ] Stellar mainnet launch
+- [x] Stellar mainnet launch
 - [ ] Multi-chain support (EVM chains, Solana)
 - [ ] Decentralized provider registry on Soroban
 - [ ] Fiat on-ramp integration (credit card → USDC → LLM)
