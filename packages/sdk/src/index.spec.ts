@@ -352,6 +352,34 @@ describe('X402Client', () => {
         expect(result.error).toContain('publicKey');
       }
     });
+    it('returns error when the external signer rejects the transaction', async () => {
+      const signTransaction = jest.fn().mockRejectedValue(new Error('User rejected'));
+      const client = new X402Client({
+        gatewayUrl: 'https://gateway.test',
+        publicKey: 'GABCDEF...',
+        signTransaction,
+        network: 'testnet',
+        paymentTimeout: 300_000,
+      });
+      const quote = {
+        paymentAddress: 'GB...',
+        amount: '10000000',
+        asset: 'USDC' as PaymentAsset,
+        expiresAt: Math.floor(Date.now() / 1000) + 300,
+      };
+      mockFetch.mockResolvedValueOnce(mock402Response({ quote }));
+      mockBuildUnsignedPaymentTransaction.mockResolvedValueOnce({
+        txHash: 'ext-sig-tx',
+        txXdr: 'UNSIGNED_XDR',
+      });
+
+      const result = await client.call(chatRequest);
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain('User rejected');
+      }
+    });
   });
 
   describe('callStream()', () => {

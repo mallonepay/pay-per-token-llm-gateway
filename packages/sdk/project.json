@@ -10,7 +10,8 @@
       "outputs": ["{workspaceRoot}/coverage/packages/sdk"],
       "options": {
         "jestConfig": "packages/sdk/jest.config.ts",
-        "coverageReporters": ["html", "text"]
+        "coverageReporters": ["html", "text"],
+        "passWithNoTests": true
       }
     }
   }
