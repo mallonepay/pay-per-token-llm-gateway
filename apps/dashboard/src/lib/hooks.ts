@@ -1,173 +1,96 @@
-'use client';
+"use client";
 
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import {
-  fetchProviders,
-  fetchAnalyticsSummary,
-  fetchTimeSeries,
-  fetchPayments,
-  fetchRoutes,
-  fetchAuditLogs,
-  createRoute,
-  updateRoute,
-  deleteRoute,
-  createProvider,
-  updateProvider,
-  type ProviderResponse,
-  type RouteResponse,
-  type AnalyticsSummary,
-  type TimeSeriesPoint,
-  type PaginatedPayments,
-  type PaginatedAuditLogs,
-} from './api';
+import { useState, useEffect, useCallback } from "react";
+import { apiGet, ApiError, getErrorMessage, isUnauthorizedError } from "@/lib/api";
+import { useAuth } from "@/lib/useAuth";
 
-// ── Query Key Factory ────────────────────────
-
-export const queryKeys = {
-  provider: ['provider'] as const,
-  analytics: (providerId?: string) => ['analytics', 'summary', providerId] as const,
-  payments: (params?: { page?: number; limit?: number; status?: string }) =>
-    ['payments', params] as const,
-  routes: (providerId?: string) => ['routes', providerId] as const,
-  auditLogs: (params?: { page?: number; limit?: number }) => ['auditLogs', params] as const,
-};
-
-// ── Provider ──────────────────────────────────
-
-export function useProvider() {
-  return useQuery<ProviderResponse | null>({
-    queryKey: queryKeys.provider,
-    queryFn: async () => {
-      const providers = await fetchProviders();
-      return providers.length > 0 ? providers[0] : null;
-    },
-    staleTime: 5 * 60_000, // 5 minutes — provider config rarely changes
-  });
+interface UseFetchOptions<T> {
+  onSuccess?: (data: T) => void;
+  onError?: (error: Error) => void;
+  enabled?: boolean;
 }
 
-// ── Analytics ─────────────────────────────────
-
-export function useAnalytics(providerId?: string) {
-  return useQuery<AnalyticsSummary>({
-    queryKey: queryKeys.analytics(providerId),
-    queryFn: () => fetchAnalyticsSummary(providerId),
-    staleTime: 30_000,
-    refetchInterval: 60_000, // auto-refresh every minute
-  });
+interface UseFetchResult<T> {
+  data: T | null;
+  error: Error | null;
+  isLoading: boolean;
+  isError: boolean;
+  refetch: () => Promise<void>;
 }
 
-export function useTimeSeries(
-  providerId?: string,
-  intervalMinutes?: number,
-  durationHours?: number,
-) {
-  return useQuery<TimeSeriesPoint[]>({
-    queryKey: ['analytics', 'timeseries', providerId, intervalMinutes, durationHours] as const,
-    queryFn: () => fetchTimeSeries(providerId!, intervalMinutes, durationHours),
-    enabled: !!providerId,
-    staleTime: 60_000,
-    refetchInterval: 60_000,
-  });
-}
+export function useFetch<T>(
+  endpoint: string,
+  options: UseFetchOptions<T> = {}
+): UseFetchResult<T> {
+  const [data, setData] = useState<T | null>(null);
+  const [error, setError] = useState<Error | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const { logout } = useAuth();
+  const { onSuccess, onError, enabled = true } = options;
 
-// ── Payments (paginated) ──────────────────────
+  const fetchData = useCallback(async () => {
+    if (!enabled) return;
 
-export function usePayments(params?: { page?: number; limit?: number; status?: string }) {
-  return useQuery<PaginatedPayments>({
-    queryKey: queryKeys.payments(params),
-    queryFn: () => fetchPayments(params),
-    placeholderData: (prev) => prev, // keep old data while fetching new page
-  });
-}
+    setIsLoading(true);
+    setError(null);
 
-// ── Routes ────────────────────────────────────
+    try {
+      const result = await apiGet<T>(endpoint);
+      setData(result);
+      onSuccess?.(result);
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      setError(error);
+      onError?.(error);
 
-export function useRoutes(providerId?: string) {
-  return useQuery<RouteResponse[]>({
-    queryKey: queryKeys.routes(providerId),
-    queryFn: () => fetchRoutes(providerId),
-    staleTime: 30_000,
-  });
-}
-
-// ── Route Mutations ───────────────────────────
-
-export function useCreateRoute() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: createRoute,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['routes'] });
-    },
-  });
-}
-
-export function useUpdateRoute() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: ({ id, data }: { id: string; data: Partial<RouteResponse> }) =>
-      updateRoute(id, data),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['routes'] });
-    },
-  });
-}
-
-export function useDeleteRoute() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: deleteRoute,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['routes'] });
-    },
-  });
-}
-
-// ── Audit Logs (paginated) ────────────────────
-
-export function useAuditLogs(params?: { page?: number; limit?: number }) {
-  return useQuery<PaginatedAuditLogs>({
-    queryKey: queryKeys.auditLogs(params),
-    queryFn: () => fetchAuditLogs(params),
-    placeholderData: (prev) => prev,
-  });
-}
-
-// ── Provider Mutations ────────────────────────
-
-export function useSaveProvider() {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: async (data: {
-      id?: string;
-      name: string;
-      payoutWalletAddress?: string;
-      webhookUrl?: string;
-      webhookSecret?: string;
-    }) => {
-      if (data.id) {
-        return updateProvider(data.id, {
-          name: data.name,
-          ...(data.payoutWalletAddress !== undefined && {
-            payoutWalletAddress: data.payoutWalletAddress,
-          }),
-          ...(data.webhookUrl !== undefined && { webhookUrl: data.webhookUrl }),
-          ...(data.webhookSecret !== undefined && { webhookSecret: data.webhookSecret }),
-        });
+      // Handle 401 - redirect to login
+      if (isUnauthorizedError(err)) {
+        logout();
       }
-      return createProvider({
-        name: data.name,
-        ...(data.payoutWalletAddress && { payoutWalletAddress: data.payoutWalletAddress }),
-        ...(data.webhookUrl && { webhookUrl: data.webhookUrl }),
-        ...(data.webhookSecret && { webhookSecret: data.webhookSecret }),
-      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, [endpoint, enabled, onSuccess, onError, logout]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  return {
+    data,
+    error,
+    isLoading,
+    isError: !!error,
+    refetch: fetchData,
+  };
+}
+
+// Mutation hook for POST/PUT/DELETE operations
+export function useMutation<TData, TVariables>() {
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+
+  const mutate = useCallback(
+    async (
+      fn: (variables: TVariables) => Promise<TData>,
+      variables: TVariables
+    ): Promise<TData | null> => {
+      setIsLoading(true);
+      setError(null);
+
+      try {
+        const result = await fn(variables);
+        return result;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        setError(error);
+        return null;
+      } finally {
+        setIsLoading(false);
+      }
     },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.provider });
-    },
-  });
+    []
+  );
+
+  return { mutate, isLoading, error };
 }
