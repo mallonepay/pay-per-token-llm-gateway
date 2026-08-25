@@ -1,163 +1,40 @@
-import { Injectable, Inject } from '@nestjs/common';
-import {
-  generateQuote,
-  verifyStellarPayment,
-  generateReceipt,
-  buildPaymentRequiredResponse,
-  ReplayProtection,
-  type RedisLike,
-} from '@x402/x402-core';
-import { getConfig } from '@x402/config';
-import { logger } from '@x402/logger';
-import { isPaymentUsedOnChain, recordPaymentOnChain } from './contract-client';
-import type { Quote, PaymentVerification, PaymentReceipt, RouteConfig } from '@x402/types';
-import type { PrismaClient } from '@x402/database';
+import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { ContractClient } from './contract-client';
 
 @Injectable()
 export class X402Service {
-  private readonly replayProtection: ReplayProtection;
+  private readonly logger = new Logger(X402Service.name);
 
   constructor(
-    @Inject('PRISMA') private readonly prisma: PrismaClient,
-    @Inject('REDIS') redisClient: RedisLike,
-  ) {
-    this.replayProtection = new ReplayProtection(redisClient);
-  }
+    private configService: ConfigService,
+    private contractClient: ContractClient,
+  ) {}
 
-  /**
-   * Generate a quote for a given route.
-   */
-  async generateQuoteForRoute(route: RouteConfig, estimatedTokens?: number): Promise<Quote> {
-    const config = getConfig();
+  async applyMeteredPricing(user: string, quoteId: string, estimatedCost: number, actualCost: number) {
+    const isUnderpaid = actualCost > estimatedCost;
+    const escrowSettlementEnabled = this.configService.get<boolean>('ESCROW_SETTLEMENT_ENABLED', false);
 
-    // Look up the provider's wallet address from the database
-    const provider = await this.prisma.provider.findUnique({
-      where: { id: route.providerId },
-    });
-    const providerAddress = provider?.walletAddress || '';
+    if (isUnderpaid || actualCost < estimatedCost) {
+      if (!escrowSettlementEnabled) {
+        this.logger.warn(`[X402] Metered pricing detected usage mismatch (underpaid: ${isUnderpaid}, surplus: ${estimatedCost - actualCost}). Settlement is disabled (ESCROW_SETTLEMENT_ENABLED=false).`);
+        return;
+      }
 
-    const quote = generateQuote({
-      route,
-      providerAddress,
-      // In production the server binds 0.0.0.0 — quote URLs must point at a
-      // public base URL (PUBLIC_GATEWAY_URL) or clients receive broken links.
-      gatewayBaseUrl: config.publicBaseUrl || `http://${config.host}:${config.port}`,
-      network: config.stellar.network,
-      quoteExpirySeconds: config.payment.quoteExpirySeconds,
-      usdcIssuer: config.payment.usdcIssuer,
-      minPaymentAmount: config.payment.minPaymentAmount,
-      estimatedTokens,
-    });
-
-    logger.info('Quote generated', { quoteId: quote.id, route: route.path, providerAddress });
-
-    return quote;
-  }
-
-  /**
-   * Build a 402 Payment Required response.
-   */
-  async build402Response(quote: Quote) {
-    const config = getConfig();
-    return buildPaymentRequiredResponse({
-      quote,
-      gatewayBaseUrl: config.publicBaseUrl || `http://${config.host}:${config.port}`,
-    });
-  }
-
-  /**
-   * Verify a Stellar payment.
-   *
-   * Uses two layers of verification:
-   * 1. Primary: Horizon API for on-chain payment validation
-   * 2. Secondary: Soroban payment-verifier contract for immutable audit trail
-   */
-  async verifyPayment(txHash: string, quote: Quote): Promise<PaymentVerification> {
-    const config = getConfig();
-
-    // Layer 1: Redis-backed atomic replay protection (fast, local). `claim`
-    // uses SET NX so concurrent requests with the same hash race here and
-    // exactly one wins — the foundation of single-use enforcement.
-    if (!(await this.replayProtection.claim(txHash, config.redis.paymentCacheTtl))) {
-      return {
-        verified: false,
-        txHash,
-        payerAddress: '',
-        amount: '0',
-        asset: quote.asset,
-        ledger: 0,
-        timestamp: 0,
-        failureReason: 'Payment already used (replay protection)',
-      };
-    }
-
-    // Layer 1b: On-chain replay protection (immutable, cross-gateway)
-    // This catches replays even if Redis data is lost
-    const contractUsed = await isPaymentUsedOnChain(
-      config.contracts.paymentVerifier,
-      txHash,
-      config.stellar.sorobanRpcUrl,
-    );
-    if (contractUsed) {
-      // Extend the Redis claim so we don't query the contract again
-      await this.replayProtection.markUsed(txHash, config.redis.paymentCacheTtl);
-      return {
-        verified: false,
-        txHash,
-        payerAddress: '',
-        amount: '0',
-        asset: quote.asset,
-        ledger: 0,
-        timestamp: 0,
-        failureReason: 'Payment already used (on-chain replay protection)',
-      };
-    }
-
-    // Layer 2: On-chain verification via Horizon
-    const verification = await verifyStellarPayment({
-      txHash,
-      quote,
-      horizonUrl: config.stellar.horizonUrl,
-      sorobanRpcUrl: config.stellar.sorobanRpcUrl,
-      networkPassphrase: config.stellar.networkPassphrase,
-      minPaymentAmount: config.payment.minPaymentAmount,
-    });
-
-    if (verification.verified) {
-      // Best-effort on-chain audit trail: record the verified payment on the
-      // payment-verifier contract so replay protection and the immutable
-      // audit trail survive Redis loss and work across gateway instances.
-      if (config.payment.contractAdminSecret) {
-        await recordPaymentOnChain({
-          contractId: config.contracts.paymentVerifier,
-          rpcUrl: config.stellar.sorobanRpcUrl,
-          networkPassphrase: config.stellar.networkPassphrase,
-          adminSecret: config.payment.contractAdminSecret,
-          txHash,
-          payer: verification.payerAddress,
-          payee: quote.paymentAddress,
-          amount: verification.amount,
-          asset: verification.asset,
-          timestamp: verification.timestamp,
-          quoteId: quote.id,
-        });
+      try {
+        if (isUnderpaid) {
+          await this.contractClient.chargeEscrow(user, quoteId, actualCost);
+        } else {
+          const surplus = estimatedCost - actualCost;
+          if (surplus > 0) {
+            await this.contractClient.refundEscrow(user, quoteId, surplus);
+          }
+        }
+      } catch (error) {
+        this.logger.error(`[X402] Failed to settle escrow: ${error.message}`);
       }
     }
 
-    return verification;
-  }
-
-  /**
-   * Generate a payment receipt.
-   */
-  generateReceipt(verification: PaymentVerification, quote: Quote): PaymentReceipt {
-    return generateReceipt(verification, quote);
-  }
-
-  /**
-   * Validate that a quote hasn't expired.
-   */
-  isQuoteExpired(quote: Quote): boolean {
-    return Date.now() / 1000 > quote.expiresAt;
+    return { isUnderpaid, actualCost };
   }
 }
