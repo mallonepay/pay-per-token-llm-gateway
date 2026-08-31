@@ -341,3 +341,40 @@ export function updateProvider(
     body: JSON.stringify(data),
   });
 }
+
+// ── Escrow ───────────────────────────────────
+
+export interface EscrowBalanceResponse {
+  address: string;
+  balance: string;
+  balanceUsdc: string;
+}
+
+export interface EscrowUsageItem {
+  user: string;
+  amount: string;
+  amountUsdc: string;
+  quoteId: string;
+  timestamp: number;
+}
+
+export interface EscrowUsageResponse {
+  address: string;
+  usage: EscrowUsageItem[];
+  total: number;
+  offset: number;
+  limit: number;
+}
+
+export function fetchEscrowBalance(address: string): Promise<EscrowBalanceResponse> {
+  return request<EscrowBalanceResponse>(`/x402/escrow/balance/${address}`);
+}
+
+export function fetchEscrowUsage(
+  address: string,
+  offset = 0,
+  limit = 20,
+): Promise<EscrowUsageResponse> {
+  const qs = new URLSearchParams({ offset: String(offset), limit: String(limit) });
+  return request<EscrowUsageResponse>(`/x402/escrow/usage/${address}?${qs.toString()}`);
+}

@@ -88,6 +88,37 @@ describe('PaymentsService', () => {
     jest.clearAllMocks();
   });
 
+  describe('createEscrowPayment', () => {
+    it('creates a confirmed payment record for escrow', async () => {
+      const quote = makeQuote();
+      const route = makeRoute();
+      const payer = 'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL';
+
+      (mockPrisma.payment.create as jest.Mock).mockResolvedValue({
+        id: quote.id,
+        quoteId: quote.id,
+        status: 'confirmed',
+        payerAddress: payer,
+      });
+
+      const res = await service.createEscrowPayment(quote, route, payer);
+
+      expect(mockPrisma.payment.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            quoteId: 'quote-1',
+            routeId: 'route-1',
+            providerId: 'provider-1',
+            status: 'confirmed',
+            payerAddress: payer,
+            txHash: 'escrow:quote-1',
+          }),
+        }),
+      );
+      expect(res.status).toBe('confirmed');
+    });
+  });
+
   describe('createPendingPayment', () => {
     it('creates a pending payment record', async () => {
       const quote = makeQuote();

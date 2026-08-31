@@ -10,12 +10,14 @@ import {
   Settings,
   Webhook,
   Shield,
+  Wallet,
 } from 'lucide-react';
 
 const links = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/routes', label: 'Routes', icon: Route },
   { href: '/payments', label: 'Payments', icon: DollarSign },
+  { href: '/escrow', label: 'Escrow', icon: Wallet },
   { href: '/audit', label: 'Audit Log', icon: FileText },
   { href: '/webhooks', label: 'Webhooks', icon: Webhook },
   { href: '/settings', label: 'Settings', icon: Settings },

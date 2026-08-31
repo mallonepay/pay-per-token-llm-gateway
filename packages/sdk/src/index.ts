@@ -60,9 +60,14 @@ export class X402Client {
 
     logger.info('Making x402 call', { url, model: request.model });
 
+    const userHeaders: Record<string, string> = {};
+    if (this.config.userAddress) {
+      userHeaders['X-User-Address'] = this.config.userAddress;
+    }
+
     const firstResponse = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...options?.headers },
+      headers: { 'Content-Type': 'application/json', ...userHeaders, ...options?.headers },
       body: JSON.stringify(request),
     });
 
@@ -94,9 +99,14 @@ export class X402Client {
     const streamingRequest = { ...request, stream: true };
     const url = `${this.config.gatewayUrl}${route}`;
 
+    const userHeaders: Record<string, string> = {};
+    if (this.config.userAddress) {
+      userHeaders['X-User-Address'] = this.config.userAddress;
+    }
+
     const firstResponse = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...options?.headers },
+      headers: { 'Content-Type': 'application/json', ...userHeaders, ...options?.headers },
       body: JSON.stringify(streamingRequest),
     });
 

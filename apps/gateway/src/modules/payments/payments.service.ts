@@ -49,6 +49,47 @@ export class PaymentsService {
   }
 
   /**
+   * Create a confirmed payment record for an escrow-funded request.
+   */
+  async createEscrowPayment(
+    quote: Quote,
+    route: RouteConfig,
+    payerAddress: string,
+  ): Promise<PaymentRecord> {
+    const receipt: PaymentReceipt = {
+      id: quote.id,
+      quoteId: quote.id,
+      txHash: `escrow:${quote.id}`,
+      payerAddress,
+      amount: quote.amount,
+      asset: quote.asset,
+      route: route.path,
+      status: 'confirmed',
+      verifiedAt: new Date().toISOString(),
+      ledger: 0,
+    };
+
+    const record = await prisma.payment.create({
+      data: {
+        quoteId: quote.id,
+        routeId: route.id,
+        providerId: route.providerId,
+        txHash: `escrow:${quote.id}`,
+        payerAddress,
+        amount: BigInt(quote.amount),
+        asset: quote.asset,
+        status: 'confirmed',
+        verifiedAt: new Date(),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        receiptJson: receipt as any,
+      },
+    });
+
+    logger.info('Escrow payment created', { quoteId: quote.id, payerAddress });
+    return record;
+  }
+
+  /**
    * Atomically confirm a payment after successful verification.
    *
    * Single-use guarantee: the update only touches rows that are still

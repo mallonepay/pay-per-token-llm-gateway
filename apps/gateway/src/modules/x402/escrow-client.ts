@@ -1,10 +1,10 @@
 /**
  * Soroban contract client for the credit-escrow contract.
  *
- * Enables per-token metered billing: after each LLM response the gateway
- * charges the actual cost from the caller's escrow balance and auto-refunds
- * any surplus. All contract interactions are best-effort — failures are
- * logged but never block the LLM response from reaching the caller.
+ * Enables per-token metered billing: before forwarding the request, the gateway
+ * reads the user's credit-escrow balance. If sufficient, it skips Horizon payment
+ * verification and uses escrow. After each LLM response the gateway charges the
+ * actual cost from the caller's escrow balance and auto-refunds any surplus.
  *
  * Requires `CONTRACT_ADMIN_SECRET` and `ESCROW_SETTLEMENT_ENABLED=true`.
  */
@@ -14,6 +14,30 @@ import { logger } from '@x402/logger';
 import { accountAddressToScVal, amountToScVal } from './soroban-utils';
 
 // ── Public API ───────────────────────────────
+
+export interface EscrowBalanceOptions {
+  contractId: string;
+  rpcUrl: string;
+  networkPassphrase?: string;
+  user: string;
+}
+
+export interface EscrowUsageOptions {
+  contractId: string;
+  rpcUrl: string;
+  networkPassphrase?: string;
+  user: string;
+  offset?: number;
+  limit?: number;
+}
+
+export interface EscrowUsageEvent {
+  user: string;
+  amount: string;
+  amountUsdc?: string;
+  quoteId: string;
+  timestamp: number;
+}
 
 export interface EscrowChargeOptions {
   contractId: string;
@@ -46,7 +70,172 @@ export interface EscrowResult {
   error?: string;
 }
 
+// ── ScVal Helper ─────────────────────────────
+
+export function scValToBigIntValue(val: unknown): bigint {
+  if (val === null || val === undefined) return 0n;
+  if (typeof val === 'bigint') return val;
+  if (typeof val === 'number') return BigInt(Math.floor(val));
+  if (typeof val === 'string') {
+    try {
+      return BigInt(val);
+    } catch {
+      return 0n;
+    }
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const vAny = val as any;
+  if (typeof vAny.switch === 'function') {
+    const arm = vAny.arm();
+    const v = vAny.value();
+    if (arm === 'i128') {
+      const lo = BigInt(v.lo().toString());
+      const hi = BigInt(v.hi().toString());
+      return (hi << 64n) + lo;
+    }
+    if (arm === 'u64' || arm === 'i64' || arm === 'u32' || arm === 'i32') {
+      return BigInt(v.toString());
+    }
+  }
+  if (vAny.lo !== undefined) {
+    const lo = BigInt(vAny.lo.toString());
+    const hi = vAny.hi !== undefined ? BigInt(vAny.hi.toString()) : 0n;
+    return (hi << 64n) + lo;
+  }
+  return 0n;
+}
+
+export function stroopsToUsdc(stroops: string): string {
+  try {
+    const n = BigInt(stroops);
+    const whole = n / 10000000n;
+    const frac = (n % 10000000n).toString().padStart(7, '0');
+    return `${whole}.${frac}`;
+  } catch {
+    return '0.0000000';
+  }
+}
+
 // ── Core Operations ───────────────────────────
+
+/**
+ * Query a user's credit-escrow balance from the Soroban contract.
+ * Returns balance in stroops as a string. Returns '0' on failure.
+ */
+export async function getEscrowBalance(options: EscrowBalanceOptions): Promise<string> {
+  const { contractId, rpcUrl, networkPassphrase, user } = options;
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { contract } = await import('@stellar/stellar-sdk');
+    const { Client } = contract;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const client: any = await Client.from({
+      contractId,
+      rpcUrl,
+      networkPassphrase: networkPassphrase || 'Test SDF Network ; September 2015',
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res: any = await client.balance({
+      user: accountAddressToScVal(user),
+    });
+
+    const val = res?.result !== undefined ? res.result : res;
+    const balanceBig = scValToBigIntValue(val);
+    return balanceBig.toString();
+  } catch (err) {
+    logger.warn(
+      `[escrow] getEscrowBalance failed for user ${user.slice(0, 8)}... — ` +
+        `falling back to '0'. Error: ${(err as Error).message}`,
+    );
+    return '0';
+  }
+}
+
+/**
+ * Query a user's usage history from the credit-escrow contract.
+ */
+export async function getEscrowUsage(options: EscrowUsageOptions): Promise<EscrowUsageEvent[]> {
+  const { contractId, rpcUrl, networkPassphrase, user, offset = 0, limit = 20 } = options;
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { contract, xdr, Address } = await import('@stellar/stellar-sdk');
+    const { Client } = contract;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const client: any = await Client.from({
+      contractId,
+      rpcUrl,
+      networkPassphrase: networkPassphrase || 'Test SDF Network ; September 2015',
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const res: any = await client.get_usage({
+      user: accountAddressToScVal(user),
+      offset: xdr.ScVal.scvU32(offset),
+      limit: xdr.ScVal.scvU32(limit),
+    });
+
+    const val = res?.result !== undefined ? res.result : res;
+    if (!val) return [];
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let items: any[] = [];
+    if (Array.isArray(val)) {
+      items = val;
+    } else if (typeof val.switch === 'function' && val.arm() === 'vec') {
+      items = val.value() || [];
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return items.map((item: any) => {
+      let itemUser = user;
+      let itemAmount = '0';
+      let itemQuoteId = '';
+      let itemTimestamp = 0;
+
+      if (item && typeof item === 'object') {
+        if (item.user) {
+          try {
+            if (typeof item.user === 'string') {
+              itemUser = item.user;
+            } else if (typeof item.user.switch === 'function') {
+              itemUser = Address.fromScVal(item.user).toString();
+            }
+          } catch {
+            itemUser = user;
+          }
+        }
+        if (item.amount !== undefined) {
+          itemAmount = scValToBigIntValue(item.amount).toString();
+        }
+        if (item.quote_id !== undefined || item.quoteId !== undefined) {
+          const q = item.quote_id ?? item.quoteId;
+          itemQuoteId = typeof q === 'string' ? q : q?.toString() || '';
+        }
+        if (item.timestamp !== undefined) {
+          itemTimestamp = Number(scValToBigIntValue(item.timestamp));
+        }
+      }
+
+      return {
+        user: itemUser,
+        amount: itemAmount,
+        amountUsdc: stroopsToUsdc(itemAmount),
+        quoteId: itemQuoteId,
+        timestamp: itemTimestamp,
+      };
+    });
+  } catch (err) {
+    logger.warn(
+      `[escrow] getEscrowUsage failed for user ${user.slice(0, 8)}... — Error: ${(err as Error).message}`,
+    );
+    return [];
+  }
+}
 
 /**
  * Charge a user's escrow balance for actual LLM usage.
