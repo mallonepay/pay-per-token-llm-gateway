@@ -19,6 +19,10 @@ import {
   type TimeSeriesPoint,
   type PaginatedPayments,
   type PaginatedAuditLogs,
+  fetchEscrowBalance,
+  fetchEscrowUsage,
+  type EscrowBalanceResponse,
+  type EscrowUsageResponse,
 } from './api';
 
 // ── Query Key Factory ────────────────────────
@@ -169,5 +173,27 @@ export function useSaveProvider() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.provider });
     },
+  });
+}
+
+// ── Escrow ───────────────────────────────────
+
+export function useEscrowBalance(address?: string | null) {
+  return useQuery<EscrowBalanceResponse>({
+    queryKey: ['escrow', 'balance', address] as const,
+    queryFn: () => fetchEscrowBalance(address!),
+    enabled: !!address,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  });
+}
+
+export function useEscrowUsage(address?: string | null, offset = 0, limit = 20) {
+  return useQuery<EscrowUsageResponse>({
+    queryKey: ['escrow', 'usage', address, offset, limit] as const,
+    queryFn: () => fetchEscrowUsage(address!, offset, limit),
+    enabled: !!address,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
   });
 }

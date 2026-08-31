@@ -18,9 +18,65 @@ jest.mock('dns/promises', () => ({
 let mockPaymentStore: Record<string, any>[] = [];
 let mockAnalyticsStore: Record<string, any>[] = [];
 
+// ── Mock Escrow Store ──────────────────────────
+
+const E2E_PAYER = 'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL';
+let mockEscrowBalances: Record<string, string> = {
+  [E2E_PAYER]: '50000000', // 5 USDC
+};
+
+const mockChargeEscrow = jest.fn().mockImplementation(({ user, amount, quoteId }: any) => {
+  const current = BigInt(mockEscrowBalances[user] || '0');
+  const deduction = BigInt(amount);
+  if (current >= deduction) {
+    mockEscrowBalances[user] = (current - deduction).toString();
+    return Promise.resolve({ success: true });
+  }
+  return Promise.resolve({ success: false, error: 'Insufficient balance' });
+});
+
+const mockRefundEscrow = jest.fn().mockResolvedValue({ success: true });
+const mockSettleEscrow = jest.fn().mockResolvedValue(undefined);
+
+jest.mock('../modules/x402/escrow-client', () => ({
+  getEscrowBalance: jest.fn().mockImplementation(({ user }: any) => {
+    return Promise.resolve(mockEscrowBalances[user] || '0');
+  }),
+  getEscrowUsage: jest.fn().mockImplementation(({ user, offset = 0, limit = 20 }: any) => {
+    const list = [
+      {
+        user,
+        amount: '1000000',
+        amountUsdc: '0.1000000',
+        quoteId: 'quote-escrow-001',
+        timestamp: Math.floor(Date.now() / 1000) - 3600,
+      },
+    ];
+    return Promise.resolve(list.slice(offset, offset + limit));
+  }),
+  chargeEscrow: (...args: any[]) => mockChargeEscrow(...args),
+  refundEscrow: (...args: any[]) => mockRefundEscrow(...args),
+  settleEscrow: (...args: any[]) => mockSettleEscrow(...args),
+  stroopsToUsdc: (stroops: string) => {
+    try {
+      const n = BigInt(stroops);
+      const whole = n / 10000000n;
+      const frac = (n % 10000000n).toString().padStart(7, '0');
+      return `${whole}.${frac}`;
+    } catch {
+      return '0.0000000';
+    }
+  },
+  scValToBigIntValue: (val: any) => BigInt(val || 0),
+}));
+
 function resetMockStore() {
   mockPaymentStore = [];
   mockAnalyticsStore = [];
+  mockEscrowBalances = {
+    [E2E_PAYER]: '50000000',
+  };
+  mockChargeEscrow.mockClear();
 }
 
 // ── Route registry for dynamic route resolution ─
@@ -1258,5 +1314,195 @@ describe('x402 Gateway E2E — Admin Endpoint Security', () => {
 
   it('requires authentication for admin audit logs', async () => {
     await request(app.getHttpServer()).get('/api/v1/admin/audit').expect(401);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Soroban Credit-Escrow Flow Tests
+// ═══════════════════════════════════════════════════════════════════
+
+describe('x402 Gateway E2E — Soroban Credit-Escrow Flow', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    global.fetch = createHorizonAndLLMFetch() as any;
+    const moduleFixture: TestingModule = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider('REDIS')
+      .useValue({
+        eval: jest.fn().mockResolvedValue(1),
+        exists: jest.fn().mockResolvedValue(0),
+        set: jest.fn().mockResolvedValue('OK'),
+        on: jest.fn(),
+        connect: jest.fn(),
+        ping: jest.fn().mockResolvedValue('PONG'),
+      })
+      .overrideProvider('PRISMA')
+      .useValue(mockPrisma)
+      .compile();
+    app = moduleFixture.createNestApplication();
+    app.setGlobalPrefix('api/v1');
+    app.useGlobalFilters(new HttpExceptionFilter());
+    app.useGlobalPipes(
+      new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+    );
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  beforeEach(() => {
+    resetMockStore();
+    jest.clearAllMocks();
+    global.fetch = createHorizonAndLLMFetch() as any;
+  });
+
+  it('bypasses Horizon payment and charges escrow when user has sufficient balance (non-streaming)', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/api/v1/chat/completions')
+      .set('X-User-Address', PAYER)
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'Escrow prompt' }] })
+      .expect(200);
+
+    expect(res.body.id).toBe('chatcmpl-e2e-test');
+    expect(res.body.choices[0].message.content).toContain('x402 gateway');
+    expect(res.headers['x-escrow-charged']).toBe('true');
+    expect(res.headers['x-actual-cost']).toBe('1000000');
+
+    const receipt = JSON.parse(res.headers['x-payment-receipt']);
+    expect(receipt.payerAddress).toBe(PAYER);
+    expect(receipt.paymentMethod).toBe('escrow');
+    expect(receipt.actualCost).toBe('1000000');
+
+    expect(mockChargeEscrow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        user: PAYER,
+        amount: '1000000',
+      }),
+    );
+  });
+
+  it('bypasses Horizon payment and charges escrow on streaming requests', async () => {
+    const orig = global.fetch;
+    global.fetch = jest.fn().mockImplementation(async (url: string) => {
+      const u = String(url);
+      if (u.includes('mock-llm')) {
+        const sse = `data: {"id":"s-escrow","object":"chat.completion.chunk","choices":[{"delta":{"content":"Escrow Stream"},"index":0}]}\\n\\ndata: [DONE]\\n\\n`;
+        const stream = new ReadableStream({
+          start(c: any) {
+            c.enqueue(new TextEncoder().encode(sse));
+            c.close();
+          },
+        });
+        return { ok: true, status: 200, body: stream };
+      }
+      return { ok: false, status: 404 };
+    }) as any;
+
+    try {
+      const res = await request(app.getHttpServer())
+        .post('/api/v1/chat/completions')
+        .set('X-User-Address', PAYER)
+        .send({
+          model: 'gpt-4',
+          messages: [{ role: 'user', content: 'Stream escrow' }],
+          stream: true,
+        })
+        .expect(200);
+
+      expect(res.headers['content-type']).toContain('text/event-stream');
+      expect(res.text).toContain('Escrow Stream');
+      expect(res.text).toContain('x402_receipt');
+      expect(mockChargeEscrow).toHaveBeenCalled();
+    } finally {
+      global.fetch = orig;
+    }
+  });
+
+  it('charges exact actual per-token cost for per-token routes with escrow', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/api/v1/chat/completions')
+      .set('X-User-Address', PAYER)
+      .send({ model: 'gpt-4-per-token', messages: [{ role: 'user', content: 'Per token escrow' }] })
+      .expect(200);
+
+    expect(res.headers['x-actual-cost']).toBe('25000');
+    expect(res.headers['x-escrow-charged']).toBe('true');
+
+    const receipt = JSON.parse(res.headers['x-payment-receipt']);
+    expect(receipt.actualCost).toBe('25000');
+    expect(receipt.tokensUsed).toBe(500);
+    expect(receipt.paymentMethod).toBe('escrow');
+
+    expect(mockChargeEscrow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        user: PAYER,
+        amount: '25000',
+      }),
+    );
+  });
+
+  it('falls back to 402 when user has insufficient escrow balance and no payment hash', async () => {
+    const BROKE_USER = 'GA5ZSE6VKPVFLEXMWJQBGHE4FJHKQIFSJMLQ7H4VFQB4UHLEH5IOVK3F';
+    mockEscrowBalances[BROKE_USER] = '0';
+
+    const res = await request(app.getHttpServer())
+      .post('/api/v1/chat/completions')
+      .set('X-User-Address', BROKE_USER)
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'Broke prompt' }] })
+      .expect(402);
+
+    expect(res.body.status).toBe(402);
+    expect(res.body.quote).toBeDefined();
+    expect(res.body.quote.amount).toBe('1000000');
+  });
+
+  it('falls back to Horizon payment verification when escrow balance is insufficient and X-Payment-Hash is provided', async () => {
+    const BROKE_USER = 'GA5ZSE6VKPVFLEXMWJQBGHE4FJHKQIFSJMLQ7H4VFQB4UHLEH5IOVK3F';
+    mockEscrowBalances[BROKE_USER] = '0';
+
+    const res = await request(app.getHttpServer())
+      .post('/api/v1/chat/completions')
+      .set('X-User-Address', BROKE_USER)
+      .set('X-Payment-Hash', TX)
+      .send({ model: 'gpt-4', messages: [{ role: 'user', content: 'Pay per request fallback' }] })
+      .expect(200);
+
+    expect(res.body.id).toBe('chatcmpl-e2e-test');
+    const receipt = JSON.parse(res.headers['x-payment-receipt']);
+    expect(receipt.txHash).toBe(TX);
+    expect(receipt.status).toBe('confirmed');
+  });
+
+  it('GET /api/v1/x402/escrow/balance/:address returns user escrow balance', async () => {
+    const res = await request(app.getHttpServer())
+      .get(`/api/v1/x402/escrow/balance/${PAYER}`)
+      .expect(200);
+
+    expect(res.body.address).toBe(PAYER);
+    expect(res.body.balance).toBe('50000000');
+    expect(res.body.balanceUsdc).toBe('5.0000000');
+  });
+
+  it('GET /api/v1/x402/escrow/usage/:address returns escrow usage history', async () => {
+    const res = await request(app.getHttpServer())
+      .get(`/api/v1/x402/escrow/usage/${PAYER}`)
+      .expect(200);
+
+    expect(res.body.address).toBe(PAYER);
+    expect(res.body.usage).toBeDefined();
+    expect(res.body.usage.length).toBeGreaterThanOrEqual(1);
+    expect(res.body.usage[0].quoteId).toBe('quote-escrow-001');
+  });
+
+  it('rejects invalid Stellar address on escrow endpoints with 400', async () => {
+    await request(app.getHttpServer())
+      .get('/api/v1/x402/escrow/balance/invalid-stellar-address')
+      .expect(400);
+
+    await request(app.getHttpServer())
+      .get('/api/v1/x402/escrow/usage/invalid-stellar-address')
+      .expect(400);
   });
 });

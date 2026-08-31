@@ -296,6 +296,12 @@ export interface X402ClientConfig {
    * external signer (`signTransaction`) instead of a `secretKey`.
    */
   publicKey?: string;
+  /**
+   * User Stellar wallet address for credit-escrow deductions.
+   * When set, the SDK attaches the X-User-Address header so the gateway
+   * can deduct from prepaid escrow balance instead of paying per-request.
+   */
+  userAddress?: string;
   /** Maximum time to wait for payment confirmation (ms) */
   paymentTimeout?: number;
   /**
@@ -304,6 +310,24 @@ export interface X402ClientConfig {
    * cannot hold a secret key (e.g. browser wallet extensions, agent SDKs).
    */
   signTransaction?: (txXdr: string) => Promise<string>;
+}
+
+// ── Escrow Types ─────────────────────────────
+
+/** Escrow balance for a user address */
+export interface EscrowBalance {
+  address: StellarAddress;
+  balance: string;
+  balanceUsdc?: string;
+}
+
+/** Escrow usage event recorded on the credit-escrow contract */
+export interface EscrowUsageEvent {
+  user: StellarAddress;
+  amount: string;
+  amountUsdc?: string;
+  quoteId: string;
+  timestamp: number;
 }
 
 /** Result of the 402 → pay → retry flow */

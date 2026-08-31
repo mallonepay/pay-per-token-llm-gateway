@@ -10,6 +10,7 @@ import {
 import { getConfig } from '@x402/config';
 import { logger } from '@x402/logger';
 import { isPaymentUsedOnChain, recordPaymentOnChain } from './contract-client';
+import { getEscrowBalance, getEscrowUsage, type EscrowUsageEvent } from './escrow-client';
 import type { Quote, PaymentVerification, PaymentReceipt, RouteConfig } from '@x402/types';
 import type { PrismaClient } from '@x402/database';
 
@@ -159,5 +160,39 @@ export class X402Service {
    */
   isQuoteExpired(quote: Quote): boolean {
     return Date.now() / 1000 > quote.expiresAt;
+  }
+
+  /**
+   * Get a user's credit-escrow balance from the Soroban contract.
+   */
+  async getUserEscrowBalance(userAddress: string): Promise<string> {
+    const config = getConfig();
+    if (!config.contracts.creditEscrow) return '0';
+    return getEscrowBalance({
+      contractId: config.contracts.creditEscrow,
+      rpcUrl: config.stellar.sorobanRpcUrl,
+      networkPassphrase: config.stellar.networkPassphrase,
+      user: userAddress,
+    });
+  }
+
+  /**
+   * Get a user's credit-escrow usage history from the Soroban contract.
+   */
+  async getUserEscrowUsage(
+    userAddress: string,
+    offset = 0,
+    limit = 20,
+  ): Promise<EscrowUsageEvent[]> {
+    const config = getConfig();
+    if (!config.contracts.creditEscrow) return [];
+    return getEscrowUsage({
+      contractId: config.contracts.creditEscrow,
+      rpcUrl: config.stellar.sorobanRpcUrl,
+      networkPassphrase: config.stellar.networkPassphrase,
+      user: userAddress,
+      offset,
+      limit,
+    });
   }
 }

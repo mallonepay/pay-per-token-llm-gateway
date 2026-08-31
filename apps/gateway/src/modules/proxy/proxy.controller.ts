@@ -18,13 +18,19 @@ import { AnalyticsService } from '../analytics/analytics.service';
 import { AdminService } from '../admin/admin.service';
 import { WebhooksService } from '../webhooks/webhooks.service';
 import { RateLimitGuard } from '../../common/guards/rate-limit.guard';
-import { chatCompletionRequestSchema, txHashSchema } from '@x402/validation';
+import { chatCompletionRequestSchema, txHashSchema, stellarAddressSchema } from '@x402/validation';
 import { calculatePrice, comparePayment } from '@x402/x402-core';
 import { getConfig } from '@x402/config';
 import { logger } from '@x402/logger';
 import { generateId } from '@x402/shared';
-import { settleEscrow } from '../x402/escrow-client';
+import { chargeEscrow, settleEscrow } from '../x402/escrow-client';
 import type { ChatCompletionRequest, PaymentRecord, Quote, RouteConfig } from '@x402/types';
+
+interface EscrowForwardOptions {
+  isEscrow?: boolean;
+  userAddress?: string;
+  quoteId?: string;
+}
 
 @ApiTags('proxy')
 @Controller()
@@ -46,10 +52,10 @@ export class ProxyController {
    * Flow:
    * 1. Validate the request body
    * 2. Look up the route for the requested model + path
-   * 3. If no payment header: generate quote (with token estimate for per-token), store pending payment, return 402
-   * 4. If payment: verify on-chain, then:
-   *    - stream=true → pipe SSE stream from upstream to client
-   *    - stream=false → forward, collect full response, calculate actual cost for per-token, return JSON
+   * 3. Check for user address: if user has sufficient credit-escrow balance,
+   *    skip Horizon verification and use escrow deduction
+   * 4. If no escrow: check X-Payment-Hash header. If missing, return 402 with quote
+   * 5. If X-Payment-Hash: verify on-chain, then forward to upstream LLM
    */
   @All('chat/completions')
   @HttpCode(HttpStatus.OK)
@@ -83,9 +89,11 @@ export class ProxyController {
         });
       }
 
-      // 3. Check for payment header. When present it must be a well-formed
-      // 64-char hex transaction hash — reject garbage (and multi-value header
-      // arrays) before it reaches Redis keys or Horizon URL paths.
+      // 3. Check for user address header (credit-escrow check)
+      const userAddress = (req.headers['x-user-address'] ||
+        req.headers['x-wallet-address'] ||
+        req.headers['x-payer-address']) as string | undefined;
+
       const txHash = req.headers['x-payment-hash'] as string | undefined;
       if (txHash !== undefined) {
         const txParse = txHashSchema.safeParse(txHash);
@@ -97,11 +105,78 @@ export class ProxyController {
           });
         }
       }
+
+      // Check escrow balance if userAddress is provided
+      if (userAddress) {
+        const addrParse = stellarAddressSchema.safeParse(userAddress);
+        if (addrParse.success) {
+          const estimatedTokens =
+            route.pricingModel === 'per_token' ? body.max_tokens || undefined : undefined;
+          const quote = await this.x402Service.generateQuoteForRoute(route, estimatedTokens);
+          const requiredAmount = BigInt(quote.amount);
+
+          const escrowBalance = await this.x402Service.getUserEscrowBalance(userAddress);
+          if (BigInt(escrowBalance) >= requiredAmount && requiredAmount > 0n) {
+            logger.info('Using escrow balance for request', {
+              traceId,
+              user: userAddress.slice(0, 8),
+              escrowBalance,
+              requiredAmount: quote.amount,
+            });
+
+            // Create confirmed escrow payment record in DB
+            const payment = await this.paymentsService.createEscrowPayment(
+              quote,
+              route,
+              userAddress,
+            );
+
+            // Resolve upstream API key
+            const upstreamApiKey =
+              process.env[`UPSTREAM_API_KEY_${route.providerId.toUpperCase().replace(/-/g, '_')}`];
+
+            if (body.stream) {
+              return this.handleStreamingForward(
+                res,
+                body,
+                route,
+                payment.txHash || `escrow:${quote.id}`,
+                upstreamApiKey,
+                payment,
+                traceId,
+                startTime,
+                { isEscrow: true, userAddress, quoteId: quote.id },
+              );
+            }
+
+            return this.handleNonStreamingForward(
+              res,
+              body,
+              route,
+              payment.txHash || `escrow:${quote.id}`,
+              upstreamApiKey,
+              payment,
+              traceId,
+              startTime,
+              { isEscrow: true, userAddress, quoteId: quote.id },
+            );
+          } else {
+            logger.info('Escrow balance insufficient, falling back to per-request payment', {
+              traceId,
+              user: userAddress.slice(0, 8),
+              escrowBalance,
+              requiredAmount: quote.amount,
+            });
+          }
+        }
+      }
+
+      // 4. Per-request payment fallback: require X-Payment-Hash
       if (!txHash) {
         return this.handle402Response(res, route, traceId, model, body);
       }
 
-      // 4. Verify payment (includes cross-route replay protection)
+      // Verify payment on-chain (includes cross-route replay protection)
       const verified = await this.verifyAndConfirmPayment(txHash, route, res, traceId);
       if (!verified) {
         return; // 402 error response already sent
@@ -211,15 +286,7 @@ export class ProxyController {
 
     const existingPayment = await this.paymentsService.findByTxHash(txHash);
 
-    // SECURITY — single-use invariant. A confirmed payment row means this
-    // txHash has already been consumed; it must never grant access a second
-    // time. Previously a confirmed row on the SAME route short-circuited to
-    // `true`, letting callers pay once and replay the hash indefinitely for
-    // unlimited LLM access (and bypassing Redis/on-chain replay protection,
-    // which were only consulted for not-yet-confirmed payments). Cross-route
-    // replays are rejected first for a clearer message; same-route replays
-    // are rejected here — the DB row is evidence of consumption, never proof
-    // of freshness.
+    // SECURITY — single-use invariant.
     if (existingPayment?.status === 'confirmed') {
       if (existingPayment.routeId !== route.id) {
         logger.warn('Cross-route replay attempt', {
@@ -250,8 +317,6 @@ export class ProxyController {
     }
 
     // Use the original quote from the pending payment, or generate a new one.
-    // CRITICAL: if the original quote has expired, reject even if the payment
-    // was technically on-chain — the quote window is a security boundary.
     const storedQuote = existingPayment?.receiptJson
       ? (existingPayment.receiptJson as Quote)
       : null;
@@ -272,8 +337,6 @@ export class ProxyController {
       return false;
     }
 
-    // If no stored quote exists, generate one for verification.
-    // (This handles the case where a payment arrives without a prior 402 quote.)
     const quoteForVerification =
       storedQuote ?? (await this.x402Service.generateQuoteForRoute(route));
 
@@ -316,9 +379,6 @@ export class ProxyController {
       return false;
     }
 
-    // Atomically claim the payment. `confirmPayment` returns null when a
-    // concurrent request already consumed this hash (single-use invariant)
-    // — in that case the caller must NOT receive LLM access.
     const claimResult = existingPayment
       ? await this.paymentsService.confirmPayment(existingPayment.quoteId, verification)
       : await (async () => {
@@ -371,9 +431,6 @@ export class ProxyController {
   /**
    * Forward a streaming request: pipe SSE chunks from upstream to client.
    * For per-token routes, calculates actual cost from final SSE usage chunk.
-   *
-   * After the stream completes, sends cost/receipt data as a trailing SSE
-   * event so the SDK can extract payment info from streaming responses.
    */
   private async handleStreamingForward(
     res: Response,
@@ -384,12 +441,14 @@ export class ProxyController {
     payment: PaymentRecord | null,
     traceId: string,
     startTime: number,
+    escrowOptions?: EscrowForwardOptions,
   ) {
     logger.info('Forwarding streaming request to upstream', {
       traceId,
       model: body.model,
       upstreamUrl: route.upstreamUrl,
       pricingModel: route.pricingModel,
+      isEscrow: escrowOptions?.isEscrow,
     });
 
     res.setHeader('X-Request-Trace-Id', traceId);
@@ -404,17 +463,17 @@ export class ProxyController {
       async (totalTokens) => {
         const streamDuration = Date.now() - startTime;
 
-        // Calculate actual cost for per-token pricing
+        // Calculate actual cost
         const costResult = await this.applyMeteredPricing(
           route,
           payment,
           totalTokens,
           res,
           traceId,
+          escrowOptions,
         );
 
-        // Send cost/receipt as a trailing SSE event so the SDK can extract
-        // payment info from streaming responses (headers are already flushed).
+        // Send cost/receipt as a trailing SSE event
         if (payment) {
           const receipt = {
             id: payment.id,
@@ -426,6 +485,7 @@ export class ProxyController {
             status: payment.status,
             actualCost: costResult.actualCost,
             tokensUsed: totalTokens ?? null,
+            paymentMethod: escrowOptions?.isEscrow ? 'escrow' : 'per_request',
           };
           try {
             res.write(`data: ${JSON.stringify({ x402_receipt: receipt })}\n\n`);
@@ -447,18 +507,25 @@ export class ProxyController {
     );
 
     await this.adminService.writeAuditLog({
-      action: 'request_forwarded_stream',
+      action: escrowOptions?.isEscrow
+        ? 'escrow_request_forwarded_stream'
+        : 'request_forwarded_stream',
       entity: 'request',
       entityId: traceId,
       providerId: route.providerId,
       actor: payment?.payerAddress || 'unknown',
-      details: { model: body.model, route: route.path, txHash, traceId },
+      details: {
+        model: body.model,
+        route: route.path,
+        txHash,
+        traceId,
+        isEscrow: escrowOptions?.isEscrow,
+      },
     });
   }
 
   /**
    * Forward a non-streaming request: collect full response and return as JSON.
-   * For per-token routes, calculates actual cost from response usage.total_tokens.
    */
   private async handleNonStreamingForward(
     res: Response,
@@ -469,12 +536,14 @@ export class ProxyController {
     payment: PaymentRecord | null,
     traceId: string,
     _startTime: number,
+    escrowOptions?: EscrowForwardOptions,
   ) {
     logger.info('Forwarding request to upstream', {
       traceId,
       model: body.model,
       upstreamUrl: route.upstreamUrl,
       pricingModel: route.pricingModel,
+      isEscrow: escrowOptions?.isEscrow,
     });
 
     const { response, responseTime } = await this.proxyService.forwardRequest(
@@ -486,7 +555,14 @@ export class ProxyController {
 
     // Calculate actual cost for per-token pricing
     const tokensUsed = response.usage?.total_tokens;
-    const costResult = await this.applyMeteredPricing(route, payment, tokensUsed, res, traceId);
+    const costResult = await this.applyMeteredPricing(
+      route,
+      payment,
+      tokensUsed,
+      res,
+      traceId,
+      escrowOptions,
+    );
 
     await this.analyticsService.recordPaidRequest(
       route.path,
@@ -511,13 +587,14 @@ export class ProxyController {
           status: payment.status,
           actualCost: costResult.actualCost,
           tokensUsed: tokensUsed ?? null,
+          paymentMethod: escrowOptions?.isEscrow ? 'escrow' : 'per_request',
         }),
       );
     }
     res.setHeader('X-Request-Trace-Id', traceId);
 
     await this.adminService.writeAuditLog({
-      action: 'request_forwarded',
+      action: escrowOptions?.isEscrow ? 'escrow_request_forwarded' : 'request_forwarded',
       entity: 'request',
       entityId: traceId,
       providerId: route.providerId,
@@ -531,24 +608,28 @@ export class ProxyController {
         actualCost: costResult.actualCost,
         surplus: costResult.surplus,
         traceId,
+        isEscrow: escrowOptions?.isEscrow,
       },
     });
 
     return res.json(response);
   }
 
-  // ── Per-Token Metered Pricing ──────────────
+  // ── Per-Token Metered Pricing & Escrow Deductions ──────────────
 
   /**
-   * Apply per-token metered pricing after receiving the LLM response.
+   * Apply pricing after receiving the LLM response.
    *
-   * For flat-rate routes: simply returns the paid amount as the actual cost.
-   * For per-token routes:
+   * For escrow flows:
+   *   1. Calculates actual cost
+   *   2. Calls contract.charge() to deduct actual cost on-chain
+   *   3. Sets X-Actual-Cost, X-Escrow-Charged headers
+   *
+   * For standard per-token flows:
    *   1. Calculates actual cost from tokens used × perTokenPrice
-   *   2. Compares against the paid amount
-   *   3. Sets X-Actual-Cost, X-Tokens-Used headers
-   *   4. Records the actual cost on the payment
-   *   5. Returns the cost details for analytics
+   *   2. Compares against the paid deposit
+   *   3. Sets X-Actual-Cost, X-Tokens-Used, X-Surplus headers
+   *   4. Settles escrow (refunds surplus) if settlement enabled
    */
   private async applyMeteredPricing(
     route: RouteConfig,
@@ -556,14 +637,69 @@ export class ProxyController {
     tokensUsed: number | undefined,
     res: Response,
     traceId: string,
+    escrowOptions?: EscrowForwardOptions,
   ): Promise<{
     actualCost: string;
     surplus: string;
     isOverpaid: boolean;
     isUnderpaid: boolean;
   }> {
+    const config = getConfig();
+
+    // Escrow Deduction Flow
+    if (escrowOptions?.isEscrow && escrowOptions.userAddress) {
+      let actualCost = route.flatPrice || payment?.amount?.toString() || '0';
+      if (route.pricingModel === 'per_token' && tokensUsed) {
+        const priceResult = calculatePrice({ route, tokenCount: tokensUsed });
+        actualCost = priceResult.amount;
+      }
+
+      if (!res.headersSent) {
+        res.setHeader('X-Actual-Cost', actualCost);
+        res.setHeader('X-Escrow-Charged', 'true');
+        if (tokensUsed) {
+          res.setHeader('X-Tokens-Used', String(tokensUsed));
+        }
+      }
+
+      if (payment) {
+        await this.paymentsService.recordActualCost(payment.quoteId, actualCost, tokensUsed || 0);
+      }
+
+      logger.info('Escrow deduction calculated', {
+        traceId,
+        user: escrowOptions.userAddress.slice(0, 8),
+        tokensUsed,
+        actualCost,
+      });
+
+      // Post-request charge: deduct actual cost from escrow on-chain
+      if (config.contracts.creditEscrow) {
+        const adminSecret =
+          config.payment.contractAdminSecret ||
+          process.env.CONTRACT_ADMIN_SECRET ||
+          'SAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+        chargeEscrow({
+          contractId: config.contracts.creditEscrow,
+          rpcUrl: config.stellar.sorobanRpcUrl,
+          networkPassphrase: config.stellar.networkPassphrase,
+          adminSecret,
+          user: escrowOptions.userAddress,
+          amount: actualCost,
+          quoteId: escrowOptions.quoteId || payment?.quoteId || generateId(),
+        }).catch((err) => logger.error('Escrow charge error', { traceId, error: String(err) }));
+      }
+
+      return {
+        actualCost,
+        surplus: '0',
+        isOverpaid: false,
+        isUnderpaid: false,
+      };
+    }
+
+    // Standard Per-Request Flow
     if (route.pricingModel !== 'per_token' || !tokensUsed) {
-      // Flat-rate or no token data: actual cost = paid amount
       const paid = payment?.amount?.toString() || '0';
       if (!res.headersSent) {
         res.setHeader('X-Actual-Cost', paid);
@@ -620,11 +756,8 @@ export class ProxyController {
     }
 
     // Escrow settlement: charge actual cost + refund surplus from the
-    // caller's credit-escrow balance. Best-effort (fire-and-forget) — the
-    // LLM response has already been delivered; on-chain settlement must
-    // never block it.
+    // caller's credit-escrow balance. Best-effort (fire-and-forget).
     if (payment?.payerAddress) {
-      const config = getConfig();
       settleEscrow({
         enabled: config.payment.escrowSettlementEnabled,
         contractId: config.contracts.creditEscrow,
