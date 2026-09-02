@@ -10,6 +10,7 @@ import {
 import { getConfig } from '@x402/config';
 import { logger } from '@x402/logger';
 import { isPaymentUsedOnChain, recordPaymentOnChain } from './contract-client';
+import { getEscrowBalance } from './escrow-client';
 import type { Quote, PaymentVerification, PaymentReceipt, RouteConfig } from '@x402/types';
 import type { PrismaClient } from '@x402/database';
 
@@ -145,6 +146,84 @@ export class X402Service {
     }
 
     return verification;
+  }
+
+  /**
+   * Verify that a user has sufficient prepaid escrow balance to cover the
+   * quote amount. This allows callers to skip the per-request Stellar
+   * payment when they have funded the credit-escrow contract.
+   *
+   * Returns a synthetic PaymentVerification so the rest of the proxy flow
+   * can treat escrow like an on-chain payment.
+   */
+  async verifyEscrowPayment(userAddress: string, quote: Quote): Promise<PaymentVerification> {
+    const config = getConfig();
+
+    if (!config.payment.escrowSettlementEnabled || !config.contracts.creditEscrow) {
+      return {
+        verified: false,
+        txHash: '',
+        payerAddress: userAddress,
+        amount: '0',
+        asset: quote.asset,
+        ledger: 0,
+        timestamp: 0,
+        failureReason: 'Escrow settlement is not enabled',
+      };
+    }
+
+    const balance = await getEscrowBalance({
+      contractId: config.contracts.creditEscrow,
+      rpcUrl: config.stellar.sorobanRpcUrl,
+      networkPassphrase: config.stellar.networkPassphrase,
+      user: userAddress,
+    });
+
+    if (balance === null) {
+      return {
+        verified: false,
+        txHash: '',
+        payerAddress: userAddress,
+        amount: '0',
+        asset: quote.asset,
+        ledger: 0,
+        timestamp: 0,
+        failureReason: 'Could not read escrow balance',
+      };
+    }
+
+    const required = BigInt(quote.amount);
+    const available = BigInt(balance);
+
+    if (available < required) {
+      return {
+        verified: false,
+        txHash: '',
+        payerAddress: userAddress,
+        amount: balance,
+        asset: quote.asset,
+        ledger: 0,
+        timestamp: 0,
+        failureReason: `Escrow balance insufficient: ${balance} < ${quote.amount}`,
+      };
+    }
+
+    logger.info('Escrow payment verified', {
+      quoteId: quote.id,
+      user: userAddress.slice(0, 8),
+      balance,
+      required: quote.amount,
+    });
+
+    return {
+      verified: true,
+      txHash: '',
+      payerAddress: userAddress,
+      amount: quote.amount,
+      asset: quote.asset,
+      ledger: 0,
+      timestamp: Math.floor(Date.now() / 1000),
+    };
   }
 
   /**

@@ -15,6 +15,13 @@ import { accountAddressToScVal, amountToScVal } from './soroban-utils';
 
 // ── Public API ───────────────────────────────
 
+export interface EscrowBalanceOptions {
+  contractId: string;
+  rpcUrl: string;
+  networkPassphrase: string;
+  user: string;
+}
+
 export interface EscrowChargeOptions {
   contractId: string;
   rpcUrl: string;
@@ -48,6 +55,58 @@ export interface EscrowResult {
 
 // ── Core Operations ───────────────────────────
 
+async function buildEscrowClient(options: {
+  contractId: string;
+  rpcUrl: string;
+  networkPassphrase: string;
+}) {
+  // Dynamic import keeps the heavy @stellar/stellar-sdk contract namespace
+  // out of the initial module graph until an escrow call is actually needed.
+  const { contract } = await import('@stellar/stellar-sdk');
+  const { Client } = contract;
+  return Client.from({
+    contractId: options.contractId,
+    rpcUrl: options.rpcUrl,
+    networkPassphrase: options.networkPassphrase,
+  });
+}
+
+/**
+ * Read a user's prepaid escrow balance.
+ *
+ * Returns the balance in stroops, or `null` if the contract call fails
+ * (e.g. contract not initialized, network unreachable). Read-only and
+ * permissionless, so no admin signer is required.
+ */
+export async function getEscrowBalance(options: EscrowBalanceOptions): Promise<string | null> {
+  const { contractId, rpcUrl, networkPassphrase, user } = options;
+
+  try {
+    const client: any = await buildEscrowClient({ contractId, rpcUrl, networkPassphrase });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const result: any = await client.balance({ user: accountAddressToScVal(user) });
+
+    // The contract returns an i128. Assemble the full 128-bit value from
+    // the SDK's decoded bigint parts.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const balance = i128ToString(result);
+
+    logger.info('[escrow] Balance read', {
+      user: user.slice(0, 8),
+      balance,
+    });
+    return balance;
+  } catch (err) {
+    const message = (err as Error).message;
+    logger.warn(
+      `[escrow] getEscrowBalance failed for user ${user.slice(0, 8)}... — ` +
+        `treating balance as unavailable. Error: ${message}`,
+    );
+    return null;
+  }
+}
+
 /**
  * Charge a user's escrow balance for actual LLM usage.
  *
@@ -60,13 +119,7 @@ export async function chargeEscrow(options: EscrowChargeOptions): Promise<Escrow
 
   try {
     const adminKeypair = Keypair.fromSecret(adminSecret);
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { contract } = await import('@stellar/stellar-sdk');
-    const { Client } = contract;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const client: any = await Client.from({ contractId, rpcUrl, networkPassphrase });
+    const client: any = await buildEscrowClient({ contractId, rpcUrl, networkPassphrase });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const tx: any = await client.charge({
@@ -109,13 +162,7 @@ export async function refundEscrow(options: EscrowRefundOptions): Promise<Escrow
 
   try {
     const adminKeypair = Keypair.fromSecret(adminSecret);
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { contract } = await import('@stellar/stellar-sdk');
-    const { Client } = contract;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const client: any = await Client.from({ contractId, rpcUrl, networkPassphrase });
+    const client: any = await buildEscrowClient({ contractId, rpcUrl, networkPassphrase });
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const tx: any = await client.refund({
@@ -213,4 +260,27 @@ export async function settleEscrow(options: {
       quoteId,
     });
   }
+}
+
+// ── Helpers ───────────────────────────────────
+
+/**
+ * Convert an i128 ScVal result (as decoded by the Stellar SDK contract
+ * client) into a decimal string.
+ *
+ * The SDK returns a plain bigint when the value fits in 64 bits and an
+ * object with `lo`/`hi` bigint parts when it does not. We handle both.
+ */
+function i128ToString(value: unknown): string {
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (value && typeof value === 'object') {
+    const obj = value as { lo?: bigint; hi?: bigint };
+    const lo = obj.lo ?? 0n;
+    const hi = obj.hi ?? 0n;
+    const full = (hi << 64n) + lo;
+    return full.toString();
+  }
+  throw new Error(`Unexpected i128 result shape: ${JSON.stringify(value)}`);
 }
