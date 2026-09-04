@@ -35,11 +35,42 @@ Unpaid 402 requests are rate-limited by caller IP address (wallet-address-based 
 
 - Upstream LLM API keys are environment variables: `UPSTREAM_API_KEY_<PROVIDER_ID>`
 - JWT secrets must be at least 256 bits
-- Stellar secret keys are **never** stored server-side. The gateway only uses public keys to verify payments.
+- Payment verification uses only public keys — no Stellar secret is needed to _verify_ payments
+- `CONTRACT_ADMIN_SECRET` (the key that records payments on-chain and settles escrow) **is** stored server-side in the gateway environment. Custody matters: keep it in a secret manager, fund it with XLM, and rotate it like any other signing key.
 
 ### Audit
 
 All payment verifications, request forwarding, and admin actions are logged to the `AuditLog` table for forensic analysis.
+
+## Known Residual Risks
+
+Accepted, documented limitations as of September 2026. These are on the
+mainnet go/no-go path or consciously deferred — see
+[`MAINNET_READINESS.md`](./MAINNET_READINESS.md) for the full gate.
+
+1. **Soroban contracts are not independently audited.** payment-verifier,
+   credit-escrow, and multisig are self-tested only (23 / 43 / 32 unit tests,
+   no property/fuzz suite, no external review). An independent audit is
+   required before handling real USDC on mainnet.
+2. **Rate limiting is per IP only.** Wallet-address-based limiting is not
+   implemented. Callers behind a shared NAT can rotate through addresses to
+   evade it; single-use payment enforcement (atomic DB claim + Redis + on-chain
+   replay guards) is the stronger backstop.
+3. **Per-entry persistent storage TTLs.** Soroban records (payment audit
+   trail, escrow balances/usage, multisig proposals) each carry their own TTL,
+   refreshed on write. An entry untouched for ~1M ledgers after its last write
+   may require a paid restore-from-archive read to be read again.
+4. **Verification is fail-closed.** If Horizon errors or times out during
+   payment verification the request fails with a 5xx — valid payments are
+   never falsely accepted, but a Horizon outage blocks all paid traffic until
+   it recovers. Use dedicated RPC providers and monitor verification failures.
+5. **Mainnet safety depends on operator config.** `STELLAR_NETWORK`, Horizon /
+   Soroban RPC URLs, the network passphrase, and the USDC issuer are
+   operator-set. A "mainnet" gateway pointed at testnet endpoints would verify
+   worthless testnet payments and serve real LLM compute for them.
+6. **Underpayment settlement is gateway-side, not on-chain.** Per-token
+   debt gating runs in the gateway DB (testnet-appropriate); on-chain escrow
+   settlement is opt-in and experimental.
 
 ## Security Checklist for Production
 
