@@ -1,29 +1,44 @@
 //! x402 Credit Escrow — Soroban Smart Contract (v2)
 //!
-//! Holds prepaid credit balances for callers. Uses per-entry instance
-//! storage for O(1) writes on usage events to keep gas costs constant.
+//! Holds prepaid credit balances for callers. Per-user balances, usage
+//! history, and quote idempotency guards are individual ledger entries in
+//! PERSISTENT storage, so writes and reads stay O(1) (constant gas) as users
+//! and usage accumulate.
 //!
-//! Storage layout:
-//!   CONFIG                          → ContractConfig
-//!   (BALANCES, user)                → i128
-//!   (USAGE_COUNT, user)             → u32
-//!   (USAGE, user, idx)              → UsageEvent
-//!   (CHARGED, user, quote_id)       → bool   (charge idempotency)
-//!   (REFUNDED, user, quote_id)      → bool   (refund idempotency)
-//!   REVENUE                         → i128   (accumulated admin revenue)
+//! Storage layout (domain per key):
+//!   CONFIG                          → ContractConfig   [instance]
+//!   REVENUE                         → i128             [instance]
+//!   (BALANCES, user)                → i128             [persistent]
+//!   (USAGE_COUNT, user)             → u32              [persistent]
+//!   (USAGE, user, idx)              → UsageEvent       [persistent]
+//!   (CHARGED, user, quote_id)       → bool             [persistent]
+//!   (REFUNDED, user, quote_id)      → bool             [persistent]
 //!
-//! All entries live in instance storage (a single ContractInstance entry),
-//! so one `extend_ttl` call per state-mutating invocation keeps the instance
-//! AND the contract code alive — without it the network default TTL (~4096
-//! ledgers) would archive balances and usage history within hours. Read-only
-//! functions deliberately do NOT extend the TTL (reads are free and
-//! permissionless, so letting anyone bump the TTL by spamming reads would be
-//! an abuse vector).
+//! Instance storage physically lives inside the single ContractInstance
+//! ledger entry, which is loaded in full on EVERY invocation and is capped by
+//! the network ledger-entry size limit — so it only holds small, fixed-size
+//! data (config + the revenue scalar). Everything that grows with user count
+//! or usage volume lives in persistent storage: one ledger entry per key
+//! keeps every individual read/write cheap no matter how large the state
+//! grows.
+//!
+//! TTL / rent: persistent entries expire independently, so every
+//! state-mutating function extends BOTH the instance entry and each
+//! persistent entry it writes back to LEDGERS_TO_LIVE — a free no-op while
+//! the remaining TTL is above LEDGER_THRESHOLD. Without this the network
+//! default TTL (~4096 ledgers) would archive balances and usage history
+//! within hours. Read-only functions deliberately do NOT extend any TTL
+//! (reads are free and permissionless, so letting anyone bump the TTL by
+//! spamming reads would be an abuse vector); an entry not written for
+//! LEDGERS_TO_LIVE ledgers after its last write may require a paid
+//! restore-from-archive to be read again — the explicit durability/rent
+//! tradeoff of per-entry storage.
 
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, String,
+    Symbol, Val, Vec,
 };
 
 // ── Types ────────────────────────────────────
@@ -57,27 +72,43 @@ const REVENUE_KEY: Symbol = symbol_short!("REVENUE");
 
 // ── Storage TTL ─────────────────────────────
 //
-// Soroban instance storage and the contract code are archived once their
-// ledger TTL expires unless explicitly extended (the network default is only
-// ~4096 ledgers — hours on mainnet). Only MUTATING functions (deposit,
-// withdraw, charge, refund, withdraw_revenue, set_admin, set_paused, init)
-// bump the instance + code TTL back to LEDGERS_TO_LIVE; the call is a free
-// no-op while the remaining TTL is above LEDGER_THRESHOLD. Read-only
-// functions never extend the TTL — an unbounded read flood must not be able
-// to keep a contract alive forever at the caller's expense.
+// Every ledger entry (the ContractInstance entry AND each persistent entry)
+// is archived once its TTL expires unless explicitly extended (the network
+// default is only ~4096 ledgers — hours on mainnet). Only MUTATING functions
+// (deposit, withdraw, charge, refund, withdraw_revenue, set_admin,
+// set_paused, init) extend TTLs back to LEDGERS_TO_LIVE — the instance entry
+// via `extend_ttl` and each persistent record via `set_persistent`; both
+// calls are free no-ops while the remaining TTL is above LEDGER_THRESHOLD.
+// Read-only functions never extend any TTL — an unbounded read flood must
+// not be able to keep a contract alive forever at the caller's expense.
 const LEDGER_THRESHOLD: u32 = 500_000;
 const LEDGERS_TO_LIVE: u32 = 1_000_000;
 
 /// Maximum number of entries a single paginated read may return.
 const MAX_PAGE_SIZE: u32 = 100;
 
-/// Bump the TTL of the contract instance and code so the contract and all of
-/// its stored data are never archived while the contract is in use.
+/// Bump the TTL of the contract instance entry (config + revenue) so it is
+/// never archived while the contract is in use.
 /// Call from mutating functions only — never from read-only paths.
 fn extend_ttl(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(LEDGER_THRESHOLD, LEDGERS_TO_LIVE);
+}
+
+/// Write a persistent (per-key) ledger entry and extend that entry's TTL so
+/// it stays alive. Persistent keys are independent ledger entries — unlike
+/// instance storage, each one must have its TTL bumped individually on write.
+/// Call from mutating functions only — never from read-only paths.
+fn set_persistent<K, V>(env: &Env, key: &K, val: &V)
+where
+    K: IntoVal<Env, Val>,
+    V: IntoVal<Env, Val>,
+{
+    env.storage().persistent().set(key, val);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, LEDGER_THRESHOLD, LEDGERS_TO_LIVE);
 }
 
 // ── Events ───────────────────────────────────
@@ -144,8 +175,8 @@ impl CreditEscrow {
         token_client.transfer(&user, &env.current_contract_address(), &amount);
 
         let balance_key = (BALANCES_KEY, user.clone());
-        let current: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
-        env.storage().instance().set(&balance_key, &(current + amount));
+        let current: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        set_persistent(&env, &balance_key, &(current + amount));
 
         emit_deposit(&env, &user, amount);
     }
@@ -164,13 +195,13 @@ impl CreditEscrow {
         }
 
         let balance_key = (BALANCES_KEY, user.clone());
-        let current: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        let current: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
 
         if current < amount {
             panic!("Insufficient balance");
         }
 
-        env.storage().instance().set(&balance_key, &(current - amount));
+        set_persistent(&env, &balance_key, &(current - amount));
 
         let token_client = token::Client::new(&env, &config.asset);
         token_client.transfer(&env.current_contract_address(), &user, &amount);
@@ -193,32 +224,36 @@ impl CreditEscrow {
             panic!("Contract is paused");
         }
 
-        // Idempotency guard — O(1) lookup.
+        // Idempotency guard — O(1) lookup on a per-quote persistent entry.
         let charged_key = (CHARGED_KEY, user.clone(), quote_id.clone());
-        if env.storage().instance().has(&charged_key) {
+        if env.storage().persistent().has(&charged_key) {
             panic!("Quote already charged");
         }
-        env.storage().instance().set(&charged_key, &true);
 
         let balance_key = (BALANCES_KEY, user.clone());
-        let current: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        let current: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
 
         if current < amount {
             panic!("Insufficient prepaid balance");
         }
 
-        env.storage().instance().set(&balance_key, &(current - amount));
+        set_persistent(&env, &charged_key, &true);
+        set_persistent(&env, &balance_key, &(current - amount));
 
         // Accumulate revenue so the admin can withdraw it later.
         // `charge` deducts the user's claim on escrowed tokens but never
         // moves tokens — the contract's token balance stays the same while
         // the sum of user balances shrinks. The difference is tracked here.
+        // REVENUE is a single fixed-size scalar, so it stays in instance
+        // storage alongside CONFIG.
         let revenue: i128 = env.storage().instance().get(&REVENUE_KEY).unwrap_or(0);
-        env.storage().instance().set(&REVENUE_KEY, &(revenue + amount));
+        env.storage()
+            .instance()
+            .set(&REVENUE_KEY, &(revenue + amount));
 
-        // Record usage event at next index — O(1) write
+        // Record usage event at next index — O(1) persistent writes
         let count_key = (USAGE_COUNT_KEY, user.clone());
-        let count: u32 = env.storage().instance().get(&count_key).unwrap_or(0);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         let usage_event = UsageEvent {
             user: user.clone(),
@@ -228,8 +263,8 @@ impl CreditEscrow {
         };
 
         let usage_entry = (USAGE_KEY, user.clone(), count);
-        env.storage().instance().set(&usage_entry, &usage_event);
-        env.storage().instance().set(&count_key, &(count + 1));
+        set_persistent(&env, &usage_entry, &usage_event);
+        set_persistent(&env, &count_key, &(count + 1));
 
         emit_usage(&env, &user, amount, quote_id);
     }
@@ -250,19 +285,20 @@ impl CreditEscrow {
             panic!("Contract is paused");
         }
 
-        // Idempotency guard — O(1) lookup.
+        // Idempotency guard — O(1) lookup on a per-quote persistent entry.
         let refunded_key = (REFUNDED_KEY, user.clone(), quote_id.clone());
-        if env.storage().instance().has(&refunded_key) {
+        if env.storage().persistent().has(&refunded_key) {
             panic!("Quote already refunded");
         }
-        env.storage().instance().set(&refunded_key, &true);
 
         let balance_key = (BALANCES_KEY, user.clone());
-        let current: i128 = env.storage().instance().get(&balance_key).unwrap_or(0);
+        let current: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
         if current < amount {
             panic!("Insufficient prepaid balance");
         }
-        env.storage().instance().set(&balance_key, &(current - amount));
+
+        set_persistent(&env, &refunded_key, &true);
+        set_persistent(&env, &balance_key, &(current - amount));
 
         let token_client = token::Client::new(&env, &config.asset);
         token_client.transfer(&env.current_contract_address(), &user, &amount);
@@ -291,7 +327,9 @@ impl CreditEscrow {
         if revenue < amount {
             panic!("Insufficient accumulated revenue");
         }
-        env.storage().instance().set(&REVENUE_KEY, &(revenue - amount));
+        env.storage()
+            .instance()
+            .set(&REVENUE_KEY, &(revenue - amount));
 
         let token_client = token::Client::new(&env, &config.asset);
         token_client.transfer(&env.current_contract_address(), &destination, &amount);
@@ -305,10 +343,10 @@ impl CreditEscrow {
         env.storage().instance().get(&REVENUE_KEY).unwrap_or(0)
     }
 
-    /// O(1) balance lookup. Read-only — does not extend the storage TTL.
+    /// O(1) balance lookup. Read-only — does not extend any storage TTL.
     pub fn balance(env: Env, user: Address) -> i128 {
         let balance_key = (BALANCES_KEY, user);
-        env.storage().instance().get(&balance_key).unwrap_or(0)
+        env.storage().persistent().get(&balance_key).unwrap_or(0)
     }
 
     /// Transfer admin rights. Only callable by the current admin.
@@ -337,14 +375,14 @@ impl CreditEscrow {
     /// `saturating_add` prevents u32 overflow in the end-index computation.
     pub fn get_usage(env: Env, user: Address, offset: u32, limit: u32) -> Vec<UsageEvent> {
         let count_key = (USAGE_COUNT_KEY, user.clone());
-        let count: u32 = env.storage().instance().get(&count_key).unwrap_or(0);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
 
         let mut result = Vec::new(&env);
         let end = offset.saturating_add(limit.min(MAX_PAGE_SIZE)).min(count);
 
         for i in offset..end {
             let usage_entry = (USAGE_KEY, user.clone(), i);
-            if let Some(event) = env.storage().instance().get(&usage_entry) {
+            if let Some(event) = env.storage().persistent().get(&usage_entry) {
                 result.push_back(event);
             }
         }
@@ -358,6 +396,7 @@ impl CreditEscrow {
 mod test {
     use super::*;
     use soroban_sdk::testutils::storage::Instance as _;
+    use soroban_sdk::testutils::storage::Persistent as _;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::token::StellarAssetClient;
@@ -451,7 +490,9 @@ mod test {
         client.mock_all_auths().deposit(&user, &500_000_000i128);
 
         let quote_id = String::from_str(&env, "quote-001");
-        client.mock_all_auths().charge(&user, &100_000_000i128, &quote_id);
+        client
+            .mock_all_auths()
+            .charge(&user, &100_000_000i128, &quote_id);
         assert_eq!(client.balance(&user), 400_000_000i128);
     }
 
@@ -468,7 +509,9 @@ mod test {
         client.mock_all_auths().deposit(&user, &100_000_000i128);
 
         let quote_id = String::from_str(&env, "quote-002");
-        client.mock_all_auths().charge(&user, &500_000_000i128, &quote_id);
+        client
+            .mock_all_auths()
+            .charge(&user, &500_000_000i128, &quote_id);
     }
 
     #[test]
@@ -508,9 +551,17 @@ mod test {
         client.mock_all_auths().deposit(&user, &1_000_000_000i128);
 
         for i in 0..5 {
-            let quote_str = ["quote-000", "quote-001", "quote-002", "quote-003", "quote-004"][i as usize];
+            let quote_str = [
+                "quote-000",
+                "quote-001",
+                "quote-002",
+                "quote-003",
+                "quote-004",
+            ][i as usize];
             let quote = String::from_str(&env, quote_str);
-            client.mock_all_auths().charge(&user, &(10_000_000 * (i + 1) as i128), &quote);
+            client
+                .mock_all_auths()
+                .charge(&user, &(10_000_000 * (i + 1) as i128), &quote);
         }
 
         let page1 = client.get_usage(&user, &0, &2);
@@ -558,7 +609,9 @@ mod test {
         ];
         for i in 0..150u32 {
             let quote = String::from_str(&env, labels[i as usize]);
-            client.mock_all_auths().charge(&user, &((i + 1) as i128 * 1_000_000), &quote);
+            client
+                .mock_all_auths()
+                .charge(&user, &((i + 1) as i128 * 1_000_000), &quote);
         }
 
         // Request 150 entries — only MAX_PAGE_SIZE are returned.
@@ -708,9 +761,13 @@ mod test {
         client.mock_all_auths().deposit(&user, &500_000_000i128);
 
         let quote_id = String::from_str(&env, "quote-001");
-        client.mock_all_auths().charge(&user, &100_000_000i128, &quote_id);
+        client
+            .mock_all_auths()
+            .charge(&user, &100_000_000i128, &quote_id);
         // Second charge for the SAME quote must be rejected (no double-deduct).
-        client.mock_all_auths().charge(&user, &100_000_000i128, &quote_id);
+        client
+            .mock_all_auths()
+            .charge(&user, &100_000_000i128, &quote_id);
     }
 
     #[test]
@@ -755,8 +812,12 @@ mod test {
 
         let quote_id = String::from_str(&env, "quote-set");
         // Actual cost = 200; surplus = 300.
-        client.mock_all_auths().charge(&user, &200_000_000i128, &quote_id);
-        client.mock_all_auths().refund(&user, &300_000_000i128, &quote_id);
+        client
+            .mock_all_auths()
+            .charge(&user, &200_000_000i128, &quote_id);
+        client
+            .mock_all_auths()
+            .refund(&user, &300_000_000i128, &quote_id);
 
         // Escrow balance fully settled: 500 - 200 - 300 = 0.
         assert_eq!(client.balance(&user), 0);
@@ -773,14 +834,19 @@ mod test {
         let env = Env::default();
         let (_admin, user, _asset, client) = setup(&env);
 
-        StellarAssetClient::new(&env, &_asset)            .mock_all_auths()
+        StellarAssetClient::new(&env, &_asset)
+            .mock_all_auths()
             .mint(&user, &1_000_000_000i128);
         client.mock_all_auths().deposit(&user, &500_000_000i128);
 
         let quote_id = String::from_str(&env, "quote-ref");
-        client.mock_all_auths().refund(&user, &100_000_000i128, &quote_id);
+        client
+            .mock_all_auths()
+            .refund(&user, &100_000_000i128, &quote_id);
         // Second refund for the SAME quote must be rejected.
-        client.mock_all_auths().refund(&user, &100_000_000i128, &quote_id);
+        client
+            .mock_all_auths()
+            .refund(&user, &100_000_000i128, &quote_id);
     }
 
     #[test]
@@ -816,7 +882,9 @@ mod test {
         client.mock_all_auths().deposit(&user, &100_000_000i128);
 
         let quote_id = String::from_str(&env, "quote-big");
-        client.mock_all_auths().refund(&user, &200_000_000i128, &quote_id);
+        client
+            .mock_all_auths()
+            .refund(&user, &200_000_000i128, &quote_id);
     }
 
     // ── Revenue withdrawal tests ──────────────────
@@ -836,7 +904,9 @@ mod test {
         client.mock_all_auths().charge(&user, &200_000_000i128, &q);
         assert_eq!(client.get_revenue(), 200_000_000i128);
 
-        client.mock_all_auths().withdraw_revenue(&revenue_dest, &200_000_000i128);
+        client
+            .mock_all_auths()
+            .withdraw_revenue(&revenue_dest, &200_000_000i128);
 
         let token_client = token::Client::new(&env, &asset);
         assert_eq!(token_client.balance(&revenue_dest), 200_000_000i128);
@@ -878,8 +948,12 @@ mod test {
 
         let q1 = String::from_str(&env, "q1");
         let q2 = String::from_str(&env, "q2");
-        client.mock_all_auths().charge(&user1, &100_000_000i128, &q1);
-        client.mock_all_auths().charge(&user2, &200_000_000i128, &q2);
+        client
+            .mock_all_auths()
+            .charge(&user1, &100_000_000i128, &q1);
+        client
+            .mock_all_auths()
+            .charge(&user2, &200_000_000i128, &q2);
 
         assert_eq!(client.get_revenue(), 300_000_000i128);
     }
@@ -900,7 +974,9 @@ mod test {
         assert_eq!(client.get_revenue(), 300_000_000i128);
 
         // Withdraw only part of the revenue.
-        client.mock_all_auths().withdraw_revenue(&dest, &100_000_000i128);
+        client
+            .mock_all_auths()
+            .withdraw_revenue(&dest, &100_000_000i128);
         assert_eq!(client.get_revenue(), 200_000_000i128);
         let token_client = token::Client::new(&env, &asset);
         assert_eq!(token_client.balance(&dest), 100_000_000i128);
@@ -943,7 +1019,9 @@ mod test {
         assert_eq!(client.get_revenue(), 100_000_000i128);
 
         // Try to withdraw more than has been accumulated.
-        client.mock_all_auths().withdraw_revenue(&dest, &200_000_000i128);
+        client
+            .mock_all_auths()
+            .withdraw_revenue(&dest, &200_000_000i128);
     }
 
     #[test]
@@ -1153,7 +1231,10 @@ mod test {
 
         let sum_balances = client.balance(&user1) + client.balance(&user2);
         assert_eq!(sum_balances, 500_000_000i128);
-        assert_eq!(sum_balances + client.get_revenue(), token_client.balance(&contract_id));
+        assert_eq!(
+            sum_balances + client.get_revenue(),
+            token_client.balance(&contract_id)
+        );
 
         // Charge from both.
         let q1 = String::from_str(&env, "inv-mq1");
@@ -1241,11 +1322,93 @@ mod test {
             "deposit did not extend the instance TTL"
         );
 
+        // The balance is a per-user persistent entry and must have had its
+        // OWN TTL extended — not just the instance entry's.
+        let balance_key = (BALANCES_KEY, user.clone());
+        let entry_ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&balance_key)
+        });
+        assert!(
+            entry_ttl >= LEDGERS_TO_LIVE,
+            "deposit did not extend the balance entry TTL"
+        );
+
         // Jump 100k ledgers (>> the ~4096 default TTL, < LEDGERS_TO_LIVE).
         env.ledger()
             .set_sequence_number(env.ledger().sequence() + 100_000);
 
         assert_eq!(client.balance(&user), 500_000_000i128);
+    }
+
+    #[test]
+    fn test_persistent_entries_extend_ttl_on_write() {
+        // Per-user balances, usage events, and quote guards live in per-key
+        // persistent entries. Each write must extend that entry's own TTL —
+        // not just the instance entry — or the state would be archived at the
+        // ~4096-ledger network default.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let asset = env.register_stellar_asset_contract(token_admin);
+
+        let contract_id = env.register(CreditEscrow, ());
+        let client = CreditEscrowClient::new(&env, &contract_id);
+        client.init(&admin, &asset);
+
+        StellarAssetClient::new(&env, &asset)
+            .mock_all_auths()
+            .mint(&user, &1_000_000_000i128);
+        client.mock_all_auths().deposit(&user, &500_000_000i128);
+
+        let quote_id = String::from_str(&env, "persist-escrow-ttl");
+        client
+            .mock_all_auths()
+            .charge(&user, &100_000_000i128, &quote_id);
+
+        let balance_key = (BALANCES_KEY, user.clone());
+        let charged_key = (CHARGED_KEY, user.clone(), quote_id.clone());
+        let usage_key = (USAGE_KEY, user.clone(), 0u32);
+        let usage_count_key = (USAGE_COUNT_KEY, user.clone());
+
+        let ttl_of = |key: &(Symbol, Address)| {
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(key))
+        };
+        let ttl_of_str = |key: &(Symbol, Address, String)| {
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(key))
+        };
+        let ttl_of_u32 = |key: &(Symbol, Address, u32)| {
+            env.as_contract(&contract_id, || env.storage().persistent().get_ttl(key))
+        };
+
+        // Every persistent entry written by deposit + charge must be alive.
+        assert!(
+            ttl_of(&balance_key) >= LEDGERS_TO_LIVE,
+            "balance entry TTL not extended"
+        );
+        assert!(
+            ttl_of_str(&charged_key) >= LEDGERS_TO_LIVE,
+            "charge-guard entry TTL not extended"
+        );
+        assert!(
+            ttl_of_u32(&usage_key) >= LEDGERS_TO_LIVE,
+            "usage-event entry TTL not extended"
+        );
+        assert!(
+            ttl_of(&usage_count_key) >= LEDGERS_TO_LIVE,
+            "usage-count entry TTL not extended"
+        );
+
+        // Reads must leave every entry's TTL untouched.
+        let ttl_before = ttl_of(&balance_key);
+        client.balance(&user);
+        client.get_usage(&user, &0, &u32::MAX);
+        client.get_revenue();
+        assert_eq!(
+            ttl_of(&balance_key),
+            ttl_before,
+            "a read-only call must not extend a persistent entry's TTL"
+        );
     }
 
     // ── Remaining edge coverage: paused refund, withdraw auth, governance auth ──

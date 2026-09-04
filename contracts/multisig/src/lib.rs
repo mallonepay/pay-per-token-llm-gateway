@@ -6,18 +6,34 @@
 //! Use case: Provider wants to require multiple signers
 //! before transferring accumulated gateway revenue to their wallet.
 //!
-//! All entries live in instance storage (a single ContractInstance entry),
-//! so one `extend_ttl` call per state-mutating invocation keeps the instance
-//! AND the contract code alive — without it the network default TTL (~4096
-//! ledgers) would archive proposals and config within hours. Read-only
-//! functions deliberately do NOT extend the TTL (reads are free and
-//! permissionless, so letting anyone bump the TTL by spamming reads would be
-//! an abuse vector).
+//! Storage layout (domain per key):
+//!   CONFIG              → MultisigConfig   [instance]
+//!   PROPOSAL_COUNT      → u32              [instance] (monotonic counter)
+//!   (PROPOSALS, id)     → Proposal         [persistent]
+//!
+//! Instance storage physically lives inside the single ContractInstance
+//! ledger entry, which is loaded in full on EVERY invocation and is capped by
+//! the network ledger-entry size limit — so it only holds small, fixed-size
+//! data (config + one counter). Proposals are unbounded and each one is an
+//! independent ledger entry in PERSISTENT storage, so reads/writes stay O(1)
+//! (constant gas) no matter how many proposals accumulate.
+//!
+//! TTL / rent: persistent entries expire independently, so every
+//! state-mutating function extends BOTH the instance entry and each
+//! persistent entry it writes back to LEDGERS_TO_LIVE — a free no-op while
+//! the remaining TTL is above LEDGER_THRESHOLD. Without this the network
+//! default TTL (~4096 ledgers) would archive proposals and config within
+//! hours. Read-only functions deliberately do NOT extend any TTL (reads are
+//! free and permissionless, so letting anyone bump the TTL by spamming reads
+//! would be an abuse vector); an entry not written for LEDGERS_TO_LIVE
+//! ledgers after its last write may require a paid restore-from-archive to be
+//! read again — the explicit durability/rent tradeoff of per-entry storage.
 
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, Address, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, token, Address, Env, IntoVal, String,
+    Symbol, Val, Vec,
 };
 
 #[contracttype]
@@ -45,26 +61,43 @@ const PROPOSAL_COUNT_KEY: Symbol = symbol_short!("PROPCT");
 
 // ── Storage TTL ─────────────────────────────
 //
-// Soroban instance storage and the contract code are archived once their
-// ledger TTL expires unless explicitly extended (the network default is only
-// ~4096 ledgers — hours on mainnet). Only MUTATING functions (init, propose,
-// approve, set_signers) bump the instance + code TTL back to LEDGERS_TO_LIVE;
-// the call is a free no-op while the remaining TTL is above LEDGER_THRESHOLD.
-// Read-only functions never extend the TTL — an unbounded read flood must not
-// be able to keep a contract alive forever at the caller's expense.
+// Every ledger entry (the ContractInstance entry AND each persistent entry)
+// is archived once its TTL expires unless explicitly extended (the network
+// default is only ~4096 ledgers — hours on mainnet). Only MUTATING functions
+// (init, propose, approve, set_signers) extend TTLs back to LEDGERS_TO_LIVE —
+// the instance entry via `extend_ttl` and each persistent record via
+// `set_persistent`; both calls are free no-ops while the remaining TTL is
+// above LEDGER_THRESHOLD. Read-only functions never extend any TTL — an
+// unbounded read flood must not be able to keep a contract alive forever at
+// the caller's expense.
 const LEDGER_THRESHOLD: u32 = 500_000;
 const LEDGERS_TO_LIVE: u32 = 1_000_000;
 
 /// Maximum number of entries a single paginated read may return.
 const MAX_PAGE_SIZE: u32 = 100;
 
-/// Bump the TTL of the contract instance and code so the contract and all of
-/// its stored data are never archived while the contract is in use.
+/// Bump the TTL of the contract instance entry (config + counter) so it is
+/// never archived while the contract is in use.
 /// Call from mutating functions only — never from read-only paths.
 fn extend_ttl(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(LEDGER_THRESHOLD, LEDGERS_TO_LIVE);
+}
+
+/// Write a persistent (per-key) ledger entry and extend that entry's TTL so
+/// it stays alive. Persistent keys are independent ledger entries — unlike
+/// instance storage, each one must have its TTL bumped individually on write.
+/// Call from mutating functions only — never from read-only paths.
+fn set_persistent<K, V>(env: &Env, key: &K, val: &V)
+where
+    K: IntoVal<Env, Val>,
+    V: IntoVal<Env, Val>,
+{
+    env.storage().persistent().set(key, val);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, LEDGER_THRESHOLD, LEDGERS_TO_LIVE);
 }
 
 // ── Events ───────────────────────────────────
@@ -86,7 +119,8 @@ fn emit_executed(env: &Env, proposal_id: u32, destination: &Address, amount: i12
 
 fn emit_signers_changed(env: &Env, new_signers: &Vec<Address>, new_threshold: u32) {
     let topics = (symbol_short!("sigs_chng"),);
-    env.events().publish(topics, (new_signers.clone(), new_threshold));
+    env.events()
+        .publish(topics, (new_signers.clone(), new_threshold));
 }
 
 #[contract]
@@ -129,11 +163,7 @@ impl Multisig {
             panic!("Amount must be positive");
         }
 
-        let mut count: u32 = env
-            .storage()
-            .instance()
-            .get(&PROPOSAL_COUNT_KEY)
-            .unwrap();
+        let mut count: u32 = env.storage().instance().get(&PROPOSAL_COUNT_KEY).unwrap();
         let proposal_id = count;
         count += 1;
         env.storage().instance().set(&PROPOSAL_COUNT_KEY, &count);
@@ -148,7 +178,7 @@ impl Multisig {
         };
 
         let proposals_key = (PROPOSALS_KEY, proposal_id);
-        env.storage().instance().set(&proposals_key, &proposal);
+        set_persistent(&env, &proposals_key, &proposal);
 
         emit_proposed(&env, proposal_id, &proposal.destination, proposal.amount);
 
@@ -165,11 +195,7 @@ impl Multisig {
         }
 
         let proposals_key = (PROPOSALS_KEY, proposal_id);
-        let mut proposal: Proposal = env
-            .storage()
-            .instance()
-            .get(&proposals_key)
-            .unwrap();
+        let mut proposal: Proposal = env.storage().persistent().get(&proposals_key).unwrap();
 
         if proposal.executed {
             panic!("Proposal already executed");
@@ -196,7 +222,10 @@ impl Multisig {
             emit_executed(&env, proposal_id, &proposal.destination, proposal.amount);
         }
 
-        env.storage().instance().set(&proposals_key, &proposal);
+        // Write back the updated proposal (approvals / executed flag) as its
+        // own persistent entry — `set_persistent` also extends its TTL, so a
+        // proposal that takes weeks to reach quorum stays alive throughout.
+        set_persistent(&env, &proposals_key, &proposal);
     }
 
     /// Rotate the signer set and threshold.
@@ -260,32 +289,39 @@ impl Multisig {
         emit_signers_changed(&env, &config.signers, config.threshold);
     }
 
-    /// O(1) lookup of a single proposal. Read-only — does not extend the
+    /// O(1) lookup of a single proposal. Read-only — does not extend any
     /// storage TTL.
     pub fn get_proposal(env: Env, proposal_id: u32) -> Proposal {
         let proposals_key = (PROPOSALS_KEY, proposal_id);
-        env.storage().instance().get(&proposals_key).unwrap()
+        env.storage().persistent().get(&proposals_key).unwrap()
     }
 
     /// Total number of proposals ever created. Read-only — does not extend
-    /// the storage TTL.
+    /// any storage TTL.
     pub fn get_proposal_count(env: Env) -> u32 {
-        env.storage().instance().get(&PROPOSAL_COUNT_KEY).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&PROPOSAL_COUNT_KEY)
+            .unwrap_or(0)
     }
 
     /// Paginated proposal listing — O(limit) reads, bounded gas. Read-only —
-    /// does not extend the storage TTL.
+    /// does not extend any storage TTL.
     ///
     /// The caller-supplied `limit` is clamped to MAX_PAGE_SIZE so a single
     /// invocation can never trigger more than 100 storage reads, and
     /// `saturating_add` prevents u32 overflow in the end-index computation.
     pub fn get_proposals(env: Env, offset: u32, limit: u32) -> Vec<Proposal> {
-        let count: u32 = env.storage().instance().get(&PROPOSAL_COUNT_KEY).unwrap_or(0);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&PROPOSAL_COUNT_KEY)
+            .unwrap_or(0);
         let mut result = Vec::new(&env);
         let end = offset.saturating_add(limit.min(MAX_PAGE_SIZE)).min(count);
         for i in offset..end {
             let proposals_key = (PROPOSALS_KEY, i);
-            if let Some(p) = env.storage().instance().get(&proposals_key) {
+            if let Some(p) = env.storage().persistent().get(&proposals_key) {
                 result.push_back(p);
             }
         }
@@ -316,6 +352,7 @@ fn has_unique_signers(signers: &Vec<Address>) -> bool {
 mod test {
     use super::*;
     use soroban_sdk::testutils::storage::Instance as _;
+    use soroban_sdk::testutils::storage::Persistent as _;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::token::StellarAssetClient;
@@ -604,7 +641,9 @@ mod test {
         // A quorum of current signers (both, threshold = 2) rotates the set.
         let approvers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
         let new_signers = Vec::from_array(&env, [signer2.clone(), signer3.clone()]);
-        client.mock_all_auths().set_signers(&approvers, &new_signers, &1u32);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &new_signers, &1u32);
 
         let config = client.get_config();
         assert_eq!(config.signers.len(), 2);
@@ -635,7 +674,9 @@ mod test {
         // Only signer1 approves — one short of the threshold of 2.
         let approvers = Vec::from_array(&env, [signer1.clone()]);
         let attacker_signers = Vec::from_array(&env, [attacker.clone()]);
-        client.mock_all_auths().set_signers(&approvers, &attacker_signers, &1u32);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &attacker_signers, &1u32);
     }
 
     #[test]
@@ -657,7 +698,9 @@ mod test {
 
         let approvers = Vec::from_array(&env, [signer1.clone()]);
         let attacker_signers = Vec::from_array(&env, [attacker.clone()]);
-        client.mock_all_auths().set_signers(&approvers, &attacker_signers, &1u32);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &attacker_signers, &1u32);
     }
 
     #[test]
@@ -678,7 +721,9 @@ mod test {
 
         let approvers = Vec::from_array(&env, [signer1.clone(), signer3.clone()]);
         let new_signers = Vec::from_array(&env, [signer2.clone(), signer4.clone()]);
-        client.mock_all_auths().set_signers(&approvers, &new_signers, &2u32);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &new_signers, &2u32);
 
         let config = client.get_config();
         assert_eq!(config.signers.len(), 2);
@@ -704,7 +749,9 @@ mod test {
 
         let approvers = Vec::from_array(&env, [signer1.clone(), signer2.clone(), signer1.clone()]);
         let new_signers = Vec::from_array(&env, [signer2.clone(), signer3.clone()]);
-        client.mock_all_auths().set_signers(&approvers, &new_signers, &2u32);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &new_signers, &2u32);
 
         let config = client.get_config();
         assert_eq!(config.signers.len(), 2);
@@ -753,7 +800,9 @@ mod test {
 
         let approvers = Vec::from_array(&env, [signer1.clone(), outsider.clone()]);
         let new_signers = Vec::from_array(&env, [outsider.clone()]);
-        client.mock_all_auths().set_signers(&approvers, &new_signers, &1u32);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &new_signers, &1u32);
     }
 
     #[test]
@@ -801,7 +850,9 @@ mod test {
 
         let approvers = Vec::from_array(&env, [signer1.clone()]);
         let new_signers = Vec::from_array(&env, [signer2.clone()]);
-        client.mock_all_auths().set_signers(&approvers, &new_signers, &1u32);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &new_signers, &1u32);
 
         let config = client.get_config();
         assert_eq!(config.signers.len(), 1);
@@ -884,6 +935,12 @@ mod test {
         let proposal_id = client.propose(&destination, &100_000_000i128);
 
         let ttl_before = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+        // The proposal is now its own persistent entry — reads must not bump
+        // its TTL either.
+        let proposals_key = (PROPOSALS_KEY, proposal_id);
+        let entry_before = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&proposals_key)
+        });
 
         // Read-only calls: config + lookups + an aggressive page request.
         client.get_config();
@@ -895,6 +952,13 @@ mod test {
         assert_eq!(
             ttl_after, ttl_before,
             "a read-only call must not extend the instance TTL"
+        );
+        let entry_after = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&proposals_key)
+        });
+        assert_eq!(
+            entry_after, entry_before,
+            "a read-only call must not extend a persistent entry's TTL"
         );
     }
 
@@ -946,6 +1010,17 @@ mod test {
             "propose did not extend the instance TTL"
         );
 
+        // The proposal is a per-id persistent entry and must have had its OWN
+        // TTL extended — not just the instance entry's.
+        let proposals_key = (PROPOSALS_KEY, proposal_id);
+        let entry_ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&proposals_key)
+        });
+        assert!(
+            entry_ttl >= LEDGERS_TO_LIVE,
+            "propose did not extend the proposal entry TTL"
+        );
+
         // Jump 100k ledgers (>> the ~4096 default TTL, < LEDGERS_TO_LIVE).
         env.ledger()
             .set_sequence_number(env.ledger().sequence() + 100_000);
@@ -954,6 +1029,43 @@ mod test {
         assert_eq!(proposal.amount, 100_000_000i128);
         assert!(!proposal.executed);
         assert_eq!(client.get_proposal_count(), 1);
+    }
+
+    #[test]
+    fn test_proposal_entry_ttl_refreshed_on_approve() {
+        // A proposal awaiting approvals can outlive a single write: every
+        // approve() rewrites the proposal entry, and that rewrite must refresh
+        // the entry's TTL so a slow-maturing proposal is not archived mid-
+        // approval.
+        let env = Env::default();
+        let signer1 = Address::generate(&env);
+        let signer2 = Address::generate(&env);
+        let token = Address::generate(&env);
+        let destination = Address::generate(&env);
+
+        let signers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
+
+        let contract_id = env.register(Multisig, ());
+        let client = MultisigClient::new(&env, &contract_id);
+        client.init(&signers, &2u32, &token);
+
+        let proposal_id = client.propose(&destination, &100_000_000i128);
+        let proposals_key = (PROPOSALS_KEY, proposal_id);
+
+        // First approval rewrites the entry and keeps it alive.
+        client.mock_all_auths().approve(&signer1, &proposal_id);
+        let ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&proposals_key)
+        });
+        assert!(
+            ttl >= LEDGERS_TO_LIVE,
+            "approve did not keep the proposal entry TTL extended"
+        );
+
+        // The proposal is still tracked after the write-back.
+        let proposal = client.get_proposal(&proposal_id);
+        assert_eq!(proposal.approvals.len(), 1);
+        assert!(!proposal.executed);
     }
 
     // ── Boundary / rotation config-validation edge tests ──
@@ -1018,7 +1130,9 @@ mod test {
 
         let approvers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
         let replacement = Vec::from_array(&env, [Address::generate(&env)]);
-        client.mock_all_auths().set_signers(&approvers, &replacement, &0u32);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &replacement, &0u32);
     }
 
     #[test]
@@ -1039,7 +1153,9 @@ mod test {
         // from a 1-signer set — invalid.
         let approvers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
         let replacement = Vec::from_array(&env, [signer1.clone()]);
-        client.mock_all_auths().set_signers(&approvers, &replacement, &3u32);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &replacement, &3u32);
     }
 
     #[test]

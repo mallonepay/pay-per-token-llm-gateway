@@ -1,27 +1,39 @@
 //! x402 Payment Verifier — Soroban Smart Contract
 //!
-//! Records verified x402 payments on-chain. Uses per-entry instance
-//! storage (O(1) writes) instead of a growing Vec to keep gas costs
-//! constant regardless of payment history size.
+//! Records verified x402 payments on-chain. Each record is its own ledger
+//! entry in PERSISTENT storage, so writes and reads stay O(1) (constant gas)
+//! regardless of payment history size.
 //!
-//! Storage layout:
-//!   CONFIG            → ContractConfig
-//!   PAYMENT_COUNT     → u32
-//!   (PAYMENT, idx)    → Payment          (indexed by position)
-//!   (TX_INDEX, hash)  → u32              (tx_hash → position lookup)
-//!   (USED_TX, hash)   → bool             (replay protection)
+//! Storage layout (domain per key):
+//!   CONFIG              → ContractConfig     [instance]
+//!   PAYMENT_COUNT       → u32                [instance] (monotonic counter)
+//!   (PAYMENT, idx)      → Payment            [persistent] (indexed by position)
+//!   (TX_INDEX, hash)    → u32                [persistent] (tx_hash → position)
+//!   (USED_TX, hash)     → bool               [persistent] (replay protection)
 //!
-//! All entries live in instance storage (a single ContractInstance entry),
-//! so one `extend_ttl` call per state-mutating invocation keeps the instance
-//! AND the contract code alive — without it the network default TTL (~4096
-//! ledgers) would archive the audit trail within hours. Read-only functions
-//! deliberately do NOT extend the TTL (reads are free and permissionless, so
-//! letting anyone bump the TTL by spamming reads would be an abuse vector).
+//! Instance storage physically lives inside the single ContractInstance
+//! ledger entry, which is loaded in full on EVERY invocation and is capped by
+//! the network ledger-entry size limit — so it must only hold small,
+//! fixed-size data (config + one counter). The audit trail is unbounded, so
+//! it lives in persistent storage: one ledger entry per payment keeps every
+//! individual read/write cheap no matter how large the history grows.
+//!
+//! TTL / rent: persistent entries expire independently, so every
+//! state-mutating function extends BOTH the instance entry (config/counter)
+//! and each persistent entry it writes back to LEDGERS_TO_LIVE — a free no-op
+//! while the remaining TTL is above LEDGER_THRESHOLD. Without this the
+//! network default TTL (~4096 ledgers) would archive the audit trail within
+//! hours. Read-only functions deliberately do NOT extend any TTL (reads are
+//! free and permissionless, so letting anyone bump the TTL by spamming reads
+//! would be an abuse vector); an entry not written for LEDGERS_TO_LIVE
+//! ledgers after its last write may require a paid restore-from-archive to be
+//! read again — the explicit durability/rent tradeoff of per-entry storage.
 
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec,
+    contract, contractimpl, contracttype, symbol_short, Address, Env, IntoVal, String, Symbol, Val,
+    Vec,
 };
 
 // ── Types ────────────────────────────────────
@@ -59,27 +71,43 @@ const PAYMENT_COUNT_KEY: Symbol = symbol_short!("PAY_CNT");
 
 // ── Storage TTL ─────────────────────────────
 //
-// Soroban instance storage and the contract code are archived once their
-// ledger TTL expires unless explicitly extended (the network default is only
-// ~4096 ledgers — hours on mainnet). Only MUTATING functions (init,
-// record_payment, refund_payment, set_admin, set_paused) bump the instance +
-// code TTL back to LEDGERS_TO_LIVE; the call is a free no-op while the
-// remaining TTL is above LEDGER_THRESHOLD. Read-only functions never extend
-// the TTL — an unbounded read flood must not be able to keep a contract alive
-// forever at the caller's expense.
+// Every ledger entry (the ContractInstance entry AND each persistent entry)
+// is archived once its TTL expires unless explicitly extended (the network
+// default is only ~4096 ledgers — hours on mainnet). Only MUTATING functions
+// (init, record_payment, refund_payment, set_admin, set_paused) extend TTLs
+// back to LEDGERS_TO_LIVE — the instance entry via `extend_ttl` and each
+// persistent record via `set_persistent`; both calls are free no-ops while
+// the remaining TTL is above LEDGER_THRESHOLD. Read-only functions never
+// extend any TTL — an unbounded read flood must not be able to keep a
+// contract alive forever at the caller's expense.
 const LEDGER_THRESHOLD: u32 = 500_000;
 const LEDGERS_TO_LIVE: u32 = 1_000_000;
 
 /// Maximum number of entries a single paginated read may return.
 const MAX_PAGE_SIZE: u32 = 100;
 
-/// Bump the TTL of the contract instance and code so the contract and all of
-/// its stored data are never archived while the contract is in use.
+/// Bump the TTL of the contract instance entry (config + counter) so it is
+/// never archived while the contract is in use.
 /// Call from mutating functions only — never from read-only paths.
 fn extend_ttl(env: &Env) {
     env.storage()
         .instance()
         .extend_ttl(LEDGER_THRESHOLD, LEDGERS_TO_LIVE);
+}
+
+/// Write a persistent (per-key) ledger entry and extend that entry's TTL so
+/// it stays alive. Persistent keys are independent ledger entries — unlike
+/// instance storage, each one must have its TTL bumped individually on write.
+/// Call from mutating functions only — never from read-only paths.
+fn set_persistent<K, V>(env: &Env, key: &K, val: &V)
+where
+    K: IntoVal<Env, Val>,
+    V: IntoVal<Env, Val>,
+{
+    env.storage().persistent().set(key, val);
+    env.storage()
+        .persistent()
+        .extend_ttl(key, LEDGER_THRESHOLD, LEDGERS_TO_LIVE);
 }
 
 // ── Events ───────────────────────────────────
@@ -145,18 +173,20 @@ impl PaymentVerifier {
             panic!("Amount must be positive");
         }
 
-        // Deduplication — O(1) lookup
+        // Deduplication — O(1) lookup on a per-hash persistent entry
         let used_key = (USED_TX_KEY, tx_hash.clone());
-        if env.storage().instance().has(&used_key) {
+        if env.storage().persistent().has(&used_key) {
             panic!("Payment already recorded (replay protection)");
         }
-        env.storage().instance().set(&used_key, &true);
 
-        // Get next index
+        // Get next index (monotonic counter lives in instance storage)
         let count: u32 = env.storage().instance().get(&PAYMENT_COUNT_KEY).unwrap();
         let idx = count;
 
-        // Store payment at (PAYMENT, idx) — O(1) write
+        // Record payment, tx→index mapping, and replay guard as individual
+        // persistent ledger entries — one entry per record, so gas stays
+        // constant no matter how large the history grows. `set_persistent`
+        // also extends each entry's TTL.
         let payment = Payment {
             tx_hash: tx_hash.clone(),
             payer: payer.clone(),
@@ -169,23 +199,25 @@ impl PaymentVerifier {
             refunded: false,
         };
         let payment_entry = (PAYMENT_KEY, idx);
-        env.storage().instance().set(&payment_entry, &payment);
+        set_persistent(&env, &used_key, &true);
+        set_persistent(&env, &payment_entry, &payment);
 
-        // Store tx_hash → index mapping — O(1) write
         let tx_entry = (TX_INDEX_KEY, tx_hash);
-        env.storage().instance().set(&tx_entry, &idx);
+        set_persistent(&env, &tx_entry, &idx);
 
-        // Update count — O(1) write
-        env.storage().instance().set(&PAYMENT_COUNT_KEY, &(count + 1));
+        // Update count — O(1) instance write
+        env.storage()
+            .instance()
+            .set(&PAYMENT_COUNT_KEY, &(count + 1));
 
         emit_payment_verified(&env, &payment);
     }
 
     /// O(1) check if a payment hash has been used. Read-only — does not
-    /// extend the storage TTL.
+    /// extend any storage TTL.
     pub fn is_payment_used(env: Env, tx_hash: String) -> bool {
         let used_key = (USED_TX_KEY, tx_hash);
-        env.storage().instance().has(&used_key)
+        env.storage().persistent().has(&used_key)
     }
 
     /// Get paginated payments. O(limit) reads — constant gas regardless of
@@ -201,20 +233,20 @@ impl PaymentVerifier {
 
         for i in offset..end {
             let payment_entry = (PAYMENT_KEY, i);
-            if let Some(payment) = env.storage().instance().get(&payment_entry) {
+            if let Some(payment) = env.storage().persistent().get(&payment_entry) {
                 result.push_back(payment);
             }
         }
         result
     }
 
-    /// O(1) lookup by transaction hash. Read-only — does not extend the
+    /// O(1) lookup by transaction hash. Read-only — does not extend any
     /// storage TTL.
     pub fn get_payment(env: Env, tx_hash: String) -> Option<Payment> {
         let tx_entry = (TX_INDEX_KEY, tx_hash);
-        let idx: u32 = env.storage().instance().get(&tx_entry)?;
+        let idx: u32 = env.storage().persistent().get(&tx_entry)?;
         let payment_entry = (PAYMENT_KEY, idx);
-        env.storage().instance().get(&payment_entry)
+        env.storage().persistent().get(&payment_entry)
     }
 
     /// Mark a payment as refunded. Only callable by admin.
@@ -232,24 +264,27 @@ impl PaymentVerifier {
         let tx_entry = (TX_INDEX_KEY, tx_hash.clone());
         let idx: u32 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&tx_entry)
             .expect("Payment not found");
         let payment_entry = (PAYMENT_KEY, idx);
-        let mut payment: Payment = env.storage().instance().get(&payment_entry).unwrap();
+        let mut payment: Payment = env.storage().persistent().get(&payment_entry).unwrap();
 
         if payment.refunded {
             panic!("Payment already refunded");
         }
         payment.refunded = true;
-        env.storage().instance().set(&payment_entry, &payment);
+        set_persistent(&env, &payment_entry, &payment);
 
         emit_payment_refunded(&env, tx_hash, reason);
     }
 
     /// O(1) total payment count. Read-only — does not extend the storage TTL.
     pub fn total_payments(env: Env) -> u32 {
-        env.storage().instance().get(&PAYMENT_COUNT_KEY).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&PAYMENT_COUNT_KEY)
+            .unwrap_or(0)
     }
 
     pub fn set_admin(env: Env, new_admin: Address) {
@@ -275,6 +310,7 @@ impl PaymentVerifier {
 mod test {
     use super::*;
     use soroban_sdk::testutils::storage::Instance as _;
+    use soroban_sdk::testutils::storage::Persistent as _;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger as _;
 
@@ -663,6 +699,107 @@ mod test {
         assert!(payment.verified);
     }
 
+    #[test]
+    fn test_persistent_entries_extend_ttl_on_write() {
+        // The audit trail now lives in per-key persistent entries. Each write
+        // must extend that entry's own TTL — not just the instance entry — or
+        // the record would be archived at the ~4096-ledger network default.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let tx_hash = String::from_str(&env, "persist-ttl-1");
+
+        client.mock_all_auths().record_payment(
+            &tx_hash,
+            &payer,
+            &payee,
+            &100_000_000i128,
+            &String::from_str(&env, "USDC"),
+            &1712345678u64,
+            &String::from_str(&env, "q-persist-ttl"),
+        );
+
+        // All three per-record entries must have had their TTL extended.
+        let used_key = (USED_TX_KEY, tx_hash.clone());
+        let payment_key = (PAYMENT_KEY, 0u32);
+        let tx_index_key = (TX_INDEX_KEY, tx_hash.clone());
+
+        let used_ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&used_key)
+        });
+        let payment_ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&payment_key)
+        });
+        let index_ttl = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&tx_index_key)
+        });
+
+        assert!(
+            used_ttl >= LEDGERS_TO_LIVE,
+            "replay-guard entry TTL not extended"
+        );
+        assert!(
+            payment_ttl >= LEDGERS_TO_LIVE,
+            "payment entry TTL not extended"
+        );
+        assert!(
+            index_ttl >= LEDGERS_TO_LIVE,
+            "tx-index entry TTL not extended"
+        );
+    }
+
+    #[test]
+    fn test_reads_do_not_extend_persistent_ttl() {
+        // Read-only functions must not bump the TTL of the persistent entries
+        // they touch — an unbounded read flood from any caller would otherwise
+        // keep every record alive forever at no cost to the reader.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let tx_hash = String::from_str(&env, "read-persist-ttl");
+
+        client.mock_all_auths().record_payment(
+            &tx_hash,
+            &payer,
+            &payee,
+            &100_000_000i128,
+            &String::from_str(&env, "USDC"),
+            &1712345678u64,
+            &String::from_str(&env, "q-read-persist"),
+        );
+
+        let payment_key = (PAYMENT_KEY, 0u32);
+        let ttl_before = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&payment_key)
+        });
+
+        // Read-only calls: lookups + an aggressive page request.
+        client.is_payment_used(&tx_hash);
+        client.get_payment(&tx_hash);
+        client.get_payments(&0, &u32::MAX);
+        client.total_payments();
+
+        let ttl_after = env.as_contract(&contract_id, || {
+            env.storage().persistent().get_ttl(&payment_key)
+        });
+        assert_eq!(
+            ttl_after, ttl_before,
+            "a read-only call must not extend a persistent entry's TTL"
+        );
+    }
+
     // ── Pause / admin transfer / refund edge cases ──
 
     #[test]
@@ -906,14 +1043,16 @@ mod test {
         client.mock_all_auths().set_admin(&new_admin);
 
         // The stored CONFIG now names new_admin as the admin.
-        let config: ContractConfig =
-            env.as_contract(&contract_id, || env.storage().instance().get(&CONFIG_KEY).unwrap());
+        let config: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().instance().get(&CONFIG_KEY).unwrap()
+        });
         assert_eq!(config.admin, new_admin);
 
         // The new admin is in control: an admin-only state mutation works.
         client.mock_all_auths().set_paused(&true);
-        let config_after: ContractConfig =
-            env.as_contract(&contract_id, || env.storage().instance().get(&CONFIG_KEY).unwrap());
+        let config_after: ContractConfig = env.as_contract(&contract_id, || {
+            env.storage().instance().get(&CONFIG_KEY).unwrap()
+        });
         assert!(config_after.paused);
     }
 }
