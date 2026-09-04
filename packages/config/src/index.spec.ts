@@ -151,16 +151,139 @@ describe('config security hardening', () => {
       expect(config.payment.usdcIssuer).toBe(TESTNET_USDC_ISSUER);
     });
 
-    it('lets an explicit USDC_ISSUER env var override the network default', () => {
+    it('lets an explicit USDC_ISSUER env var override the network default on test networks', () => {
+      // On testnet/futurenet an explicit issuer is a legitimate override. On
+      // mainnet it is NOT (see the mainnet-consistency guard below) — the
+      // only acceptable mainnet USDC issuer is Circle's.
       process.env.NODE_ENV = 'test';
       process.env.JWT_SECRET = 'a-real-random-256-bit-secret';
-      process.env.STELLAR_NETWORK = 'mainnet';
+      process.env.STELLAR_NETWORK = 'testnet';
       process.env.USDC_ISSUER = 'GCUSTOMISSUERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
 
       const config = loadConfig();
       expect(config.payment.usdcIssuer).toBe('GCUSTOMISSUERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX');
-      // The network preset itself is still mainnet.
+      // The network preset itself is still testnet.
+      expect(config.stellar.network).toBe('testnet');
+    });
+  });
+
+  describe('mainnet network-consistency guard', () => {
+    const REAL_JWT = 'a-real-random-256-bit-secret';
+    const MAINNET_ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN';
+
+    it('accepts a consistent mainnet configuration with defaults', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.STELLAR_NETWORK = 'mainnet';
+      delete process.env.HORIZON_URL;
+      delete process.env.SOROBAN_RPC_URL;
+      delete process.env.NETWORK_PASSPHRASE;
+      delete process.env.USDC_ISSUER;
+
+      expect(() => loadConfig()).not.toThrow();
+      const config = loadConfig();
       expect(config.stellar.network).toBe('mainnet');
+      expect(config.payment.usdcIssuer).toBe(MAINNET_ISSUER);
+    });
+
+    it('rejects a testnet Horizon URL with STELLAR_NETWORK=mainnet', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.STELLAR_NETWORK = 'mainnet';
+      process.env.HORIZON_URL = 'https://horizon-testnet.stellar.org';
+      delete process.env.USDC_ISSUER;
+
+      expect(() => loadConfig()).toThrow(/HORIZON_URL.*mainnet/);
+    });
+
+    it('rejects a testnet Soroban RPC URL with STELLAR_NETWORK=mainnet', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.STELLAR_NETWORK = 'mainnet';
+      process.env.SOROBAN_RPC_URL = 'https://soroban-testnet.stellar.org';
+      delete process.env.USDC_ISSUER;
+
+      expect(() => loadConfig()).toThrow(/SOROBAN_RPC_URL.*mainnet/);
+    });
+
+    it('rejects a non-mainnet network passphrase with STELLAR_NETWORK=mainnet', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.STELLAR_NETWORK = 'mainnet';
+      process.env.NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
+      delete process.env.USDC_ISSUER;
+
+      expect(() => loadConfig()).toThrow(/NETWORK_PASSPHRASE/);
+    });
+
+    it('rejects a non-Circle USDC issuer with STELLAR_NETWORK=mainnet', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.STELLAR_NETWORK = 'mainnet';
+      process.env.USDC_ISSUER = 'GCUSTOMISSUERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
+
+      expect(() => loadConfig()).toThrow(/USDC_ISSUER/);
+    });
+
+    it('allows a custom (non-test) mainnet Horizon URL', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.STELLAR_NETWORK = 'mainnet';
+      process.env.HORIZON_URL = 'https://horizon-mainnet.example.com';
+      delete process.env.USDC_ISSUER;
+
+      expect(() => loadConfig()).not.toThrow();
+      expect(loadConfig().stellar.horizonUrl).toBe('https://horizon-mainnet.example.com');
+    });
+
+    it('allows a custom (non-test) mainnet Soroban RPC URL', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.STELLAR_NETWORK = 'mainnet';
+      process.env.SOROBAN_RPC_URL = 'https://rpc-mainnet.example.com';
+      delete process.env.USDC_ISSUER;
+
+      expect(() => loadConfig()).not.toThrow();
+      expect(loadConfig().stellar.sorobanRpcUrl).toBe('https://rpc-mainnet.example.com');
+    });
+
+    it('is a no-op outside mainnet (testnet/futurenet defaults)', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.STELLAR_NETWORK = 'testnet';
+      process.env.HORIZON_URL = 'https://horizon-testnet.stellar.org';
+      process.env.USDC_ISSUER = 'GCUSTOMISSUERXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX';
+
+      expect(() => loadConfig()).not.toThrow();
+
+      process.env.STELLAR_NETWORK = 'futurenet';
+      expect(() => loadConfig()).not.toThrow();
+    });
+
+    it('validateEnv rejects a mainnet config pointed at testnet Horizon', () => {
+      process.env.NODE_ENV = 'development';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.DATABASE_URL = 'postgres://db.example.com:5432/x402';
+      process.env.REDIS_URL = 'redis://redis.example.com:6379';
+      process.env.STELLAR_NETWORK = 'mainnet';
+      process.env.HORIZON_URL = 'https://horizon-testnet.stellar.org';
+      delete process.env.USDC_ISSUER;
+
+      expect(() => validateEnv()).toThrow(/HORIZON_URL.*mainnet/);
+    });
+
+    it('validateEnv accepts a consistent mainnet configuration', () => {
+      process.env.NODE_ENV = 'development';
+      process.env.JWT_SECRET = REAL_JWT;
+      process.env.DATABASE_URL = 'postgres://db.example.com:5432/x402';
+      process.env.REDIS_URL = 'redis://redis.example.com:6379';
+      process.env.STELLAR_NETWORK = 'mainnet';
+      delete process.env.HORIZON_URL;
+      delete process.env.SOROBAN_RPC_URL;
+      delete process.env.NETWORK_PASSPHRASE;
+      delete process.env.USDC_ISSUER;
+
+      expect(() => validateEnv()).not.toThrow();
     });
   });
 

@@ -130,13 +130,14 @@ reserves and alert on admin-key balance.
   `HORIZON_URL` / `SOROBAN_RPC_URL` / `NETWORK_PASSPHRASE` actually point at
   testnet would verify worthless testnet payments and serve real LLM compute
   for them.
-- **Go/no-go action:** startup validation should fail fast if
-  `STELLAR_NETWORK=mainnet` while `HORIZON_URL`/`SOROBAN_RPC_URL` are not
-  mainnet endpoints or `NETWORK_PASSPHRASE` is not the mainnet passphrase
-  (`Public Global Stellar Network ; September 2015`). Today this pairing is
-  convention only (`scripts/deploy-contracts.sh` and config defaults pin
-  endpoints per network) — consider adding an explicit runtime assertion
-  before mainnet.
+- **Runtime guard: implemented.** `packages/config` runs a boot-time
+  `assertMainnetNetworkConsistency()` check (in both `validateEnv()` and
+  `loadConfig()`). With `STELLAR_NETWORK=mainnet` it fails fast when Horizon
+  or Soroban RPC points at a test/future endpoint, when `NETWORK_PASSPHRASE`
+  is not the mainnet passphrase (`Public Global Stellar Network ; September
+2015`), or when `USDC_ISSUER` is not Circle's mainnet issuer.
+  Provider-specific mainnet Horizon/RPC endpoints remain allowed (only the
+  test/future markers and the foreign passphrase/issuer are rejected).
 
 ---
 
@@ -179,9 +180,9 @@ gate, distinct from the README's generic production checklist.
 
 ### B. Network configuration
 
-- [ ] `STELLAR_NETWORK=mainnet`, mainnet `HORIZON_URL`/`SOROBAN_RPC_URL`,
-      mainnet passphrase, Circle `USDC_ISSUER` — all verified consistent
-      (consider the runtime assertion from §4).
+- [x] `STELLAR_NETWORK=mainnet`, mainnet `HORIZON_URL`/`SOROBAN_RPC_URL`,
+      mainnet passphrase, Circle `USDC_ISSUER` — enforced at boot by
+      `assertMainnetNetworkConsistency()` in `packages/config` (§4).
 - [ ] Receiving/payout accounts hold Circle USDC trustlines.
 - [ ] Wrong-issuer and wrong-network payments verified to be rejected in a
       staging rehearsal before launch.
