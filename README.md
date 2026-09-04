@@ -123,7 +123,8 @@ Caller                Gateway                 Stellar              Upstream LLM
 - **HTTP 402 Payment Required** — Standards-compliant payment flow
 - **OpenAI-compatible API** — Drop-in replacement for `/v1/chat/completions`
 - **Streaming (SSE) support** — Real-time token streaming to clients
-- **Replay protection** — Each transaction hash can only be used once, backed by Redis
+- **Single-use payments** — Each transaction hash is consumed atomically (DB claim + Redis + on-chain guards); double-use is rejected
+- **Underpayment enforcement** — Per-token debt ledger gates future access until a top-up payment clears it
 - **Rate limiting** — Configurable per-route rate limits for unpaid requests
 - **Multi-provider** — Host multiple LLM providers behind one gateway
 - **Per-route configuration** — Different pricing, models, and upstream URLs per route
@@ -135,7 +136,7 @@ Caller                Gateway                 Stellar              Upstream LLM
 | **Flat-rate** | Fixed price per request                       | Standard API access, known costs        |
 | **Per-token** | Pay per token consumed (`usage.total_tokens`) | Variable-length responses, fair billing |
 
-For per-token pricing, the client sends a deposit (estimated from `max_tokens`), the gateway calculates actual cost from the response's `usage.total_tokens`, and the surplus/underpayment is reported via response headers.
+For per-token pricing, the client sends a deposit (estimated from `max_tokens`, or a default token budget when omitted) and the gateway caps forwarded completions to that budget. After the response it calculates the actual cost from `usage.total_tokens` and reports the surplus/underpayment via headers. Underpayments are recorded as **open debt per payer**: future requests from that payer are refused with a 402 top-up quote covering deposit + debt until one payment clears the ledger (see [MAINNET_READINESS.md](./MAINNET_READINESS.md)).
 
 ### 📊 Dashboard (Next.js)
 
@@ -156,7 +157,8 @@ For per-token pricing, the client sends a deposit (estimated from `max_tokens`),
 
 ### 📡 Notifications
 
-- Webhook delivery with retry logic
+- Webhook delivery with retry logic and optional HMAC-SHA256 signed payloads
+- In-app notifications surfaced in the dashboard
 - Event types: `payment_received`, `verification_failed`, `request_forwarded`
 - Extensible notification channel system
 
@@ -492,6 +494,13 @@ stellar contract deploy \
   --network testnet
 ```
 
+The contracts store unbounded state (payment audit trail, escrow
+balances/usage, multisig proposals) as individual **persistent ledger
+entries** with per-entry TTLs, so per-transaction gas stays constant as
+history grows. Storage layout changed in the persistent-storage migration —
+always deploy the current WASM fresh rather than upgrading in place. See
+[MAINNET_READINESS.md](./MAINNET_READINESS.md) for the mainnet go/no-go gate.
+
 ---
 
 ## 🐳 Deployment
@@ -530,25 +539,32 @@ See [DEPLOYMENT.md](./DEPLOYMENT.md) for the complete step-by-step guide.
 
 ## 🔧 Environment Variables
 
-| Variable                      | Default                               | Description                                                                                                                     |
-| ----------------------------- | ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `NODE_ENV`                    | `development`                         | Environment (`production`, `test`, `development`)                                                                               |
-| `PORT`                        | `3000`                                | Gateway server port                                                                                                             |
-| `HOST`                        | `0.0.0.0`                             | Gateway server host                                                                                                             |
-| `DATABASE_URL`                | —                                     | PostgreSQL connection string                                                                                                    |
-| `REDIS_URL`                   | —                                     | Redis connection string                                                                                                         |
-| `STELLAR_NETWORK`             | `testnet`                             | Stellar network (`testnet`, `mainnet`, `futurenet`)                                                                             |
-| `HORIZON_URL`                 | `https://horizon-testnet.stellar.org` | Horizon API endpoint                                                                                                            |
-| `SOROBAN_RPC_URL`             | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint                                                                                                            |
-| `NETWORK_PASSPHRASE`          | `Test SDF Network ; September 2015`   | Stellar network passphrase                                                                                                      |
-| `USDC_ISSUER`                 | `GBBD47...`                           | USDC token issuer on Stellar                                                                                                    |
-| `JWT_SECRET`                  | — (required)                          | Secret key for JWT session tokens — the gateway fails fast if missing or set to a known placeholder (`openssl rand -base64 32`) |
-| `AUTH_DEV_MODE`               | `false`                               | Accept `dev-sig-` signatures as any wallet — for local development only, never in production                                    |
-| `TRUST_PROXY`                 | `1`                                   | Express `trust proxy` hops so IP-based rate limiting sees real client IPs behind Cloudflare/NGINX/Railway                       |
-| `QUOTE_EXPIRY_SECONDS`        | `300`                                 | Time before quotes expire (5 min)                                                                                               |
-| `LLM_REQUEST_TIMEOUT`         | `120000`                              | Upstream LLM timeout in ms                                                                                                      |
-| `CORS_ORIGINS`                | `http://localhost:3001`               | Allowed CORS origins (comma-separated)                                                                                          |
-| `UPSTREAM_API_KEY_<PROVIDER>` | —                                     | Upstream LLM API key per provider                                                                                               |
+| Variable                               | Default                               | Description                                                                                                                                                                                               |
+| -------------------------------------- | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `NODE_ENV`                             | `development`                         | Environment (`production`, `test`, `development`)                                                                                                                                                         |
+| `PORT`                                 | `3000`                                | Gateway server port                                                                                                                                                                                       |
+| `HOST`                                 | `0.0.0.0`                             | Gateway server host                                                                                                                                                                                       |
+| `DATABASE_URL`                         | —                                     | PostgreSQL connection string                                                                                                                                                                              |
+| `REDIS_URL`                            | —                                     | Redis connection string                                                                                                                                                                                   |
+| `STELLAR_NETWORK`                      | `testnet`                             | Stellar network (`testnet`, `mainnet`, `futurenet`) — on `mainnet` the gateway refuses to boot if Horizon/RPC point at a test/future network, the passphrase is foreign, or `USDC_ISSUER` is not Circle's |
+| `HORIZON_URL`                          | `https://horizon-testnet.stellar.org` | Horizon API endpoint                                                                                                                                                                                      |
+| `SOROBAN_RPC_URL`                      | `https://soroban-testnet.stellar.org` | Soroban RPC endpoint                                                                                                                                                                                      |
+| `NETWORK_PASSPHRASE`                   | `Test SDF Network ; September 2015`   | Stellar network passphrase                                                                                                                                                                                |
+| `USDC_ISSUER`                          | `GBBD47...`                           | USDC token issuer on Stellar — mainnet requires Circle's issuer                                                                                                                                           |
+| `PUBLIC_GATEWAY_URL`                   | —                                     | Public base URL used in payment quotes/instructions                                                                                                                                                       |
+| `MIN_PAYMENT_AMOUNT`                   | `10000`                               | Minimum payment amount in stroops                                                                                                                                                                         |
+| `PAYMENT_CACHE_TTL`                    | `3600`                                | Payment verification cache TTL in seconds                                                                                                                                                                 |
+| `RATE_LIMIT_WINDOW` / `RATE_LIMIT_MAX` | `60` / `10`                           | Per-IP rate limit window (seconds) and max unpaid requests                                                                                                                                                |
+| `SESSION_DURATION`                     | `86400`                               | Dashboard session duration in seconds                                                                                                                                                                     |
+| `CONTRACT_ADMIN_SECRET`                | —                                     | Secret key for on-chain payment recording / escrow settlement (store in a secret manager)                                                                                                                 |
+| `ESCROW_SETTLEMENT_ENABLED`            | `false`                               | Opt-in, experimental per-token on-chain settlement via the credit-escrow contract                                                                                                                         |
+| `JWT_SECRET`                           | — (required)                          | Secret key for JWT session tokens — the gateway fails fast if missing or set to a known placeholder (`openssl rand -base64 32`)                                                                           |
+| `AUTH_DEV_MODE`                        | `false`                               | Accept `dev-sig-` signatures as any wallet — local development only; the gateway refuses to boot with it in production                                                                                    |
+| `TRUST_PROXY`                          | `1`                                   | Express `trust proxy` hops so IP-based rate limiting sees real client IPs behind Cloudflare/NGINX/Railway                                                                                                 |
+| `QUOTE_EXPIRY_SECONDS`                 | `300`                                 | Time before quotes expire (5 min)                                                                                                                                                                         |
+| `LLM_REQUEST_TIMEOUT`                  | `120000`                              | Upstream LLM timeout in ms                                                                                                                                                                                |
+| `CORS_ORIGINS`                         | `http://localhost:3001`               | Allowed CORS origins (comma-separated)                                                                                                                                                                    |
+| `UPSTREAM_API_KEY_<PROVIDER>`          | —                                     | Upstream LLM API key per provider                                                                                                                                                                         |
 
 ---
 
@@ -570,16 +586,18 @@ See [DEPLOYMENT.md](./DEPLOYMENT.md) for the complete step-by-step guide.
 
 ### 🚧 v2 — In Progress
 
+- [x] Streaming (SSE) support with per-token pricing in SDK
+- [x] Per-token underpayment enforcement (debt gating, top-up quotes, completion cap)
+- [x] Mainnet hardening (boot guards, path-payment restriction, persistent-storage contracts)
 - [ ] Multi-provider routing with load balancing
 - [ ] Python SDK with LangChain integration
-- [ ] Streaming (SSE) support with per-token pricing in SDK
 - [ ] Kubernetes deployment manifests
 - [ ] Provider payout automation via multisig contracts
-- [ ] Prepaid credit escrow contract integration
+- [ ] Prepaid credit escrow contract integration (opt-in experimental today — see [MAINNET_READINESS.md](./MAINNET_READINESS.md))
 
 ### 💡 v3 — Planned
 
-- [ ] Stellar mainnet launch
+- [ ] Stellar mainnet launch (gated by [MAINNET_READINESS.md](./MAINNET_READINESS.md))
 - [ ] Multi-chain support (EVM chains, Solana)
 - [ ] Decentralized provider registry on Soroban
 - [ ] Fiat on-ramp integration (credit card → USDC → LLM)
