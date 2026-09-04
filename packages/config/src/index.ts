@@ -136,12 +136,6 @@ export interface GatewayConfig {
 
   /** Notification configuration */
   notifications: {
-    email: {
-      enabled: boolean;
-      smtpHost?: string;
-      smtpPort?: number;
-      fromAddress?: string;
-    };
     webhook: {
       enabled: boolean;
       retryCount: number;
@@ -472,12 +466,6 @@ export function loadConfig(): GatewayConfig {
     },
 
     notifications: {
-      email: {
-        enabled: process.env.EMAIL_ENABLED === 'true',
-        smtpHost: process.env.SMTP_HOST,
-        smtpPort: parseInt(process.env.SMTP_PORT || '587', 10),
-        fromAddress: process.env.EMAIL_FROM,
-      },
       webhook: {
         enabled: process.env.WEBHOOK_ENABLED !== 'false',
         retryCount: parseInt(process.env.WEBHOOK_RETRY_COUNT || '3', 10),

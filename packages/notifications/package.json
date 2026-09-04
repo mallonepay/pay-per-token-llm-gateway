@@ -8,10 +8,6 @@
   "dependencies": {
     "@x402/types": "workspace:*",
     "@x402/logger": "workspace:*",
-    "@x402/config": "workspace:*",
-    "nodemailer": "^6.9.0"
-  },
-  "devDependencies": {
-    "@types/nodemailer": "^6.4.15"
+    "@x402/config": "workspace:*"
   }
 }
