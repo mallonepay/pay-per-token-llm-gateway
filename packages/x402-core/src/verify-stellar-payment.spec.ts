@@ -138,13 +138,16 @@ describe('amount unit conversion (units ↔ stroops)', () => {
   });
 });
 
-function verify(opts: { quote: Quote; txHash?: string }) {
+function verify(opts: { quote: Quote; txHash?: string; allowPathPayments?: boolean }) {
   return verifyStellarPayment({
     txHash: opts.txHash ?? TX_HASH,
     quote: opts.quote,
     horizonUrl: HORIZON_URL,
     sorobanRpcUrl: 'https://soroban-testnet.stellar.org',
     networkPassphrase: 'Test SDF Network ; September 2015',
+    ...(opts.allowPathPayments !== undefined && {
+      allowPathPayments: opts.allowPathPayments,
+    }),
   });
 }
 
@@ -303,6 +306,65 @@ describe('verifyStellarPayment', () => {
 
       expect(result.verified).toBe(true);
       expect(result.amount).toBe('1000000');
+    });
+
+    it('rejects a path payment when allowPathPayments is false (mainnet policy)', async () => {
+      const quote = makeQuote(makeRoute());
+      (global as any).fetch = mockHorizonFetch({
+        tx: txData({}, quote),
+        ops: opsData([
+          {
+            type: 'path_payment_strict_receive',
+            asset_code: 'USDC',
+            asset_issuer: USDC_ISSUER,
+            to: PAYMENT_ADDRESS,
+            from: 'GPAYERACCOUNT123',
+            amount: '0.1000000', // exactly the flat-rate quote amount
+          },
+        ]),
+      });
+
+      const result = await verify({ quote, allowPathPayments: false });
+
+      expect(result.verified).toBe(false);
+      expect(result.failureReason).toBe(
+        'Path payments are not accepted on this network. Direct USDC payments only.',
+      );
+    });
+
+    it('still accepts a direct payment op when allowPathPayments is false', async () => {
+      const quote = makeQuote(makeRoute());
+      (global as any).fetch = mockHorizonFetch({
+        tx: txData({}, quote),
+        ops: opsData([paymentOp({ amount: '0.1000000' })]),
+      });
+
+      const result = await verify({ quote, allowPathPayments: false });
+
+      expect(result.verified).toBe(true);
+      expect(result.amount).toBe('1000000');
+    });
+
+    it('ignores unrelated path ops (wrong asset) without a confusing refusal', async () => {
+      const quote = makeQuote(makeRoute());
+      (global as any).fetch = mockHorizonFetch({
+        tx: txData({}, quote),
+        ops: opsData([
+          {
+            type: 'path_payment_strict_send',
+            asset_code: 'XLM',
+            asset_type: 'native',
+            to: PAYMENT_ADDRESS,
+            from: 'GPAYERACCOUNT123',
+            amount: '10.0000000',
+          },
+        ]),
+      });
+
+      const result = await verify({ quote, allowPathPayments: false });
+
+      expect(result.verified).toBe(false);
+      expect(result.failureReason).toBe('No matching payment operation found');
     });
   });
 

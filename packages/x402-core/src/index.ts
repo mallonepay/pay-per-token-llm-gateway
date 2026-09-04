@@ -146,6 +146,15 @@ export interface VerifyPaymentOptions {
   networkPassphrase: string;
   /** Minimum payment amount in stroops. Payments below this are rejected. */
   minPaymentAmount?: string;
+  /**
+   * When false, only direct `payment` operations satisfy a quote; Stellar
+   * `path_payment_*` operations are ignored even if the delivered amount
+   * matches. Intended for mainnet, where accepting path payments widens the
+   * attack surface for exotic-asset tricks and adds nothing over the direct
+   * USDC payment the protocol is designed around. Defaults to true so
+   * existing behavior is preserved when unset.
+   */
+  allowPathPayments?: boolean;
 }
 
 /**
@@ -212,13 +221,22 @@ export async function verifyStellarPayment(
     }
 
     const opsData = (await opsResponse.json()) as Record<string, any>;
-    const paymentOps =
+    const allPaymentOps =
       (opsData._embedded?.records as any[])?.filter(
         (op: any) =>
           op.type === 'payment' ||
           op.type === 'path_payment_strict_send' ||
           op.type === 'path_payment_strict_receive',
       ) || [];
+
+    // On networks that reject path payments (mainnet), only direct `payment`
+    // operations can satisfy a quote. Path ops are tracked separately so a
+    // refusal can be reported with a precise reason.
+    const allowPathPayments = options.allowPathPayments !== false;
+    const paymentOps = allowPathPayments
+      ? allPaymentOps
+      : allPaymentOps.filter((op: any) => op.type === 'payment');
+    const pathPaymentOps = allPaymentOps.filter((op: any) => op.type !== 'payment');
 
     // Amount required to satisfy this quote, in stroops — computed once up
     // front. A malformed quote price means nothing can match.
@@ -302,6 +320,34 @@ export async function verifyStellarPayment(
     });
 
     if (!matchingPayment) {
+      // When path payments are disabled, a path op that reached the provider
+      // in the right asset is a policy refusal, not a "no match" — say so
+      // explicitly instead of a generic message.
+      if (!allowPathPayments && !sawProviderOp) {
+        const pathOpReachedProvider =
+          !allowPathPayments &&
+          pathPaymentOps.some((op: any) => {
+            const assetMatches =
+              quote.asset === 'XLM'
+                ? op.asset_type === 'native'
+                : op.asset_code === quote.asset && op.asset_issuer === quote.assetIssuer;
+            return assetMatches && op.to === quote.paymentAddress;
+          });
+        if (pathOpReachedProvider) {
+          return {
+            verified: false,
+            txHash,
+            payerAddress: txData.source_account || '',
+            amount: '0',
+            asset: quote.asset,
+            ledger: txData.ledger || 0,
+            timestamp: Date.parse(txData.created_at) / 1000 || 0,
+            failureReason:
+              'Path payments are not accepted on this network. Direct USDC payments only.',
+          };
+        }
+      }
+
       // A payment reached the provider in the right asset but didn't cover
       // the quoted per-token deposit → tell the caller what's missing
       // instead of a generic "no match".

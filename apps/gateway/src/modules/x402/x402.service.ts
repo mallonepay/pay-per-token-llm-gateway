@@ -121,6 +121,12 @@ export class X402Service {
       sorobanRpcUrl: config.stellar.sorobanRpcUrl,
       networkPassphrase: config.stellar.networkPassphrase,
       minPaymentAmount: config.payment.minPaymentAmount,
+      // Mainnet verifies direct USDC `payment` operations only. Path
+      // payments (strict send/receive) are accepted on test networks where
+      // they help clients without a USDC trustline, but on mainnet they widen
+      // the surface for exotic-asset tricks and add nothing — the configured
+      // USDC issuer is the only asset that should ever satisfy a quote.
+      allowPathPayments: config.stellar.network !== 'mainnet',
     });
 
     if (verification.verified) {
