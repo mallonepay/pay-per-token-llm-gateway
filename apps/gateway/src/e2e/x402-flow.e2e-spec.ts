@@ -17,10 +17,12 @@ jest.mock('dns/promises', () => ({
 
 let mockPaymentStore: Record<string, any>[] = [];
 let mockAnalyticsStore: Record<string, any>[] = [];
+let mockDebtStore: Record<string, any>[] = [];
 
 function resetMockStore() {
   mockPaymentStore = [];
   mockAnalyticsStore = [];
+  mockDebtStore = [];
 }
 
 // ── Route registry for dynamic route resolution ─
@@ -175,12 +177,51 @@ jest.mock('@x402/database', () => ({
       }),
       aggregate: jest.fn().mockResolvedValue({ _sum: { amount: null } }),
     },
-    // Default: no open debt, so the underpayment debt gate is a no-op unless
-    // a scenario explicitly seeds debt.
+    // Store-driven: mirrors the real UnderpaymentDebt ledger so debt-gate
+    // scenarios can run end to end. With no rows the aggregate resolves a
+    // null sum (== 0n open debt), so existing scenarios are unaffected.
     underpaymentDebt: {
-      aggregate: jest.fn().mockResolvedValue({ _sum: { amount: null } }),
-      create: jest.fn().mockResolvedValue({}),
-      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+      aggregate: jest.fn().mockImplementation(({ where }: any) => {
+        const openRows = mockDebtStore.filter(
+          (d) =>
+            d.payerAddress === where?.payerAddress &&
+            d.providerId === where?.providerId &&
+            d.status === 'open',
+        );
+        if (openRows.length === 0) {
+          return Promise.resolve({ _sum: { amount: null } });
+        }
+        return Promise.resolve({
+          _sum: {
+            amount: openRows.reduce((sum, d) => sum + BigInt(d.amount), 0n),
+          },
+        });
+      }),
+      create: jest.fn().mockImplementation(({ data }: any) => {
+        const row = {
+          id: `debt-${mockDebtStore.length}`,
+          ...data,
+          settledAt: null,
+          createdAt: new Date(),
+        };
+        mockDebtStore.push(row);
+        return Promise.resolve(row);
+      }),
+      updateMany: jest.fn().mockImplementation(({ where, data }: any) => {
+        let updated = 0;
+        mockDebtStore = mockDebtStore.map((d) => {
+          const matches =
+            d.payerAddress === where?.payerAddress &&
+            d.providerId === where?.providerId &&
+            d.status === 'open';
+          if (matches) {
+            updated++;
+            return { ...d, ...data };
+          }
+          return d;
+        });
+        return Promise.resolve({ count: updated });
+      }),
     },
     auditLog: {
       findMany: jest.fn().mockResolvedValue([]),
@@ -776,6 +817,177 @@ describe('x402 Gateway E2E — Per-Token Metered Pricing', () => {
     } finally {
       global.fetch = orig;
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Underpayment Debt Gate Tests
+// ═══════════════════════════════════════════════════════════════════
+
+describe('x402 Gateway E2E — Underpayment Debt Gate', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleFixture: TestingModule = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider('REDIS')
+      .useValue({
+        eval: jest.fn().mockResolvedValue(1),
+        exists: jest.fn().mockResolvedValue(0),
+        set: jest.fn().mockResolvedValue('OK'),
+        on: jest.fn(),
+        connect: jest.fn(),
+        ping: jest.fn().mockResolvedValue('PONG'),
+      })
+      .overrideProvider('PRISMA')
+      .useValue(mockPrisma)
+      .compile();
+    app = moduleFixture.createNestApplication();
+    app.setGlobalPrefix('api/v1');
+    app.useGlobalFilters(new HttpExceptionFilter());
+    app.useGlobalPipes(
+      new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+    );
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  beforeEach(() => {
+    resetMockStore();
+    jest.clearAllMocks();
+  });
+
+  it('serves an underpaying request once, then denies access until a top-up payment clears the ledger', async () => {
+    // Per-token route: 50 stroops/token. Deposit without max_tokens =
+    // 4096 tokens (default estimate) × 50 = 204,800 stroops. The metered
+    // settlement compares actual cost against this deposit, so a request
+    // whose upstream usage far exceeds the deposit records a deficit.
+    const h1 = '11' + 'a'.repeat(62); // first request — runs up the debt
+    const h2 = '22' + 'b'.repeat(62); // ≥ deposit but < deposit + debt → refused
+    const h3 = '33' + 'c'.repeat(62); // covers deposit + debt exactly → top-up + settle
+    const h4 = '44' + 'd'.repeat(62); // ≥ deposit — ledger is clear by now
+
+    // on-chain payment per hash, in stroops (converted to decimal USDC below)
+    const paidStroops: Record<string, number> = {
+      [h1]: 1_000_000,
+      [h2]: 1_000_000,
+      [h3]: 5_000_000,
+      [h4]: 1_000_000,
+    };
+    let usageTokens = 500;
+    const USDC_ISSUER = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5';
+
+    global.fetch = jest.fn().mockImplementation(async (url: string) => {
+      const u = String(url);
+      const txId = u.split('/transactions/')[1]?.split('/')[0] ?? '';
+      if (u.includes('/transactions/') && !u.includes('/operations')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            id: txId,
+            successful: true,
+            source_account: PAYER,
+            ledger: 12345,
+            created_at: new Date().toISOString(),
+          }),
+        };
+      }
+      if (u.includes('/operations')) {
+        const stroops = paidStroops[txId] ?? 0;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            _embedded: {
+              records: [
+                {
+                  type: 'payment',
+                  from: PAYER,
+                  to: PW2,
+                  amount: (stroops / 1e7).toFixed(7),
+                  asset_code: 'USDC',
+                  asset_issuer: USDC_ISSUER,
+                  asset_type: 'credit_alphanum4',
+                },
+              ],
+            },
+          }),
+        };
+      }
+      if (u.includes('mock-llm')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            id: 'chatcmpl-debt-gate',
+            object: 'chat.completion',
+            model: 'gpt-4-per-token',
+            choices: [
+              { index: 0, message: { role: 'assistant', content: 'Debt' }, finish_reason: 'stop' },
+            ],
+            usage: { prompt_tokens: 200, completion_tokens: 300, total_tokens: usageTokens },
+          }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }) as any;
+
+    const pay = (hash: string, content: string) =>
+      request(app.getHttpServer())
+        .post('/api/v1/chat/completions')
+        .set('X-Payment-Hash', hash)
+        .send({ model: 'gpt-4-per-token', messages: [{ role: 'user', content }] });
+
+    // ── Step 1: first request is served, but the metered bill (100,000
+    //    tokens × 50 = 5,000,000) exceeds the deposit (204,800) by 4,795,200,
+    //    which must be recorded as open debt for the payer on the provider.
+    usageTokens = 100_000;
+    const first = await pay(h1, 'expensive').expect(200);
+    expect(parseInt(first.headers['x-actual-cost'])).toBe(5_000_000);
+    expect(parseInt(first.headers['x-surplus'])).toBeLessThan(0);
+    expect(mockPrisma.underpaymentDebt.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        quoteId: expect.any(String),
+        providerId: 'e2e-provider-002',
+        payerAddress: PAYER,
+        amount: 4_795_200n, // 5,000,000 actual − 204,800 deposit
+        status: 'open',
+      }),
+    });
+    expect(mockDebtStore).toHaveLength(1);
+    expect(mockDebtStore[0].status).toBe('open');
+
+    // ── Step 2: the payer returns but pays only a fresh deposit (1,000,000
+    //    ≥ deposit, < deposit + debt = 5,000,000). Access must be denied with
+    //    a 402 whose quote amount is the combined top-up, not granted.
+    usageTokens = 500;
+    const denied = await pay(h2, 'again').expect(402);
+    expect(denied.body.quote.amount).toBe('5000000'); // deposit + open debt
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ action: 'payment_debt_denied' }),
+    });
+    // The refused payment was not claimed and the debt is untouched.
+    expect(mockDebtStore).toHaveLength(1);
+    expect(mockDebtStore[0].status).toBe('open');
+    expect(mockPrisma.underpaymentDebt.updateMany).not.toHaveBeenCalled();
+
+    // ── Step 3: paying the combined total (5,000,000) clears the ledger and
+    //    the request is served; its small usage creates no new debt.
+    usageTokens = 500;
+    const toppedUp = await pay(h3, 'top-up').expect(200);
+    expect(parseInt(toppedUp.headers['x-actual-cost'])).toBe(25_000);
+    expect(mockPrisma.underpaymentDebt.updateMany).toHaveBeenCalled();
+    expect(mockDebtStore).toHaveLength(1);
+    expect(mockDebtStore[0].status).toBe('settled');
+
+    // ── Step 4: with the ledger clear, a deposit-only payment is served
+    //    again — the gate no longer blocks this payer.
+    usageTokens = 500;
+    await pay(h4, 'cleared').expect(200);
+    expect(mockDebtStore.filter((d) => d.status === 'open')).toHaveLength(0);
   });
 });
 
