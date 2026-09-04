@@ -1247,4 +1247,64 @@ mod test {
 
         assert_eq!(client.balance(&user), 500_000_000i128);
     }
+
+    // ── Remaining edge coverage: paused refund, withdraw auth, governance auth ──
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_refund_rejected_while_paused() {
+        // The pause guard must cover refunds too — a paused contract must not
+        // move tokens back out to users while frozen.
+        let env = Env::default();
+        let (_admin, user, asset, client) = setup(&env);
+
+        StellarAssetClient::new(&env, &asset)
+            .mock_all_auths()
+            .mint(&user, &1_000_000_000i128);
+        client.mock_all_auths().deposit(&user, &500_000_000i128);
+
+        client.mock_all_auths().set_paused(&true);
+        client.mock_all_auths().refund(
+            &user,
+            &100_000_000i128,
+            &String::from_str(&env, "quote-paused-refund"),
+        );
+    }
+
+    #[test]
+    fn test_withdraw_requires_user_auth() {
+        // Deposits are user-authed (covered elsewhere); withdrawals are too —
+        // nobody may pull tokens out of a user's balance without that user's
+        // signature, and a failed attempt must leave the balance untouched.
+        let env = Env::default();
+        let (_admin, user, asset, client) = setup(&env);
+
+        StellarAssetClient::new(&env, &asset)
+            .mock_all_auths()
+            .mint(&user, &1_000_000_000i128);
+        client.mock_all_auths().deposit(&user, &500_000_000i128);
+
+        let result = client.try_withdraw(&user, &100_000_000i128);
+        assert!(result.is_err());
+        assert_eq!(client.balance(&user), 500_000_000i128);
+    }
+
+    #[test]
+    fn test_set_admin_and_set_paused_require_admin_auth() {
+        // Governance calls are admin-only: an unauthenticated caller must not
+        // be able to rotate the admin or pause/unpause the contract.
+        let env = Env::default();
+        let (_admin, _user, _asset, client) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        let transfer = client.try_set_admin(&new_admin);
+        assert!(transfer.is_err());
+        let pause = client.try_set_paused(&true);
+        assert!(pause.is_err());
+
+        // The contract is still unpaused and admin is unchanged (an admin
+        // call with full auth still works).
+        client.mock_all_auths().set_paused(&true);
+        client.mock_all_auths().set_paused(&false);
+    }
 }

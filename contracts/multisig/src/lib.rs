@@ -955,4 +955,113 @@ mod test {
         assert!(!proposal.executed);
         assert_eq!(client.get_proposal_count(), 1);
     }
+
+    // ── Boundary / rotation config-validation edge tests ──
+
+    #[test]
+    #[should_panic]
+    fn test_approve_nonexistent_proposal_panics() {
+        // Approving a proposal id that was never created must not silently
+        // succeed — the missing storage entry panics rather than corrupting
+        // state or minting an approval out of thin air.
+        let env = Env::default();
+        let signer1 = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+
+        let contract_id = env.register(Multisig, ());
+        let client = MultisigClient::new(&env, &contract_id);
+        client.init(&signers, &1u32, &token);
+
+        client.mock_all_auths().approve(&signer1, &999u32);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "Rotation requires at least the threshold of current signer approvals"
+    )]
+    fn test_rotation_with_no_approvers_rejected() {
+        // Even in a 1-of-N configuration, an empty approver list can never
+        // meet the current threshold — rotation needs at least one real
+        // current signer.
+        let env = Env::default();
+        let signer1 = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let signers = Vec::from_array(&env, [signer1.clone()]);
+
+        let contract_id = env.register(Multisig, ());
+        let client = MultisigClient::new(&env, &contract_id);
+        client.init(&signers, &1u32, &token);
+
+        let empty_approvers = Vec::new(&env);
+        let replacement = Vec::from_array(&env, [Address::generate(&env)]);
+        client.set_signers(&empty_approvers, &replacement, &1u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Threshold must be at least 1")]
+    fn test_rotation_rejects_zero_new_threshold() {
+        // The quorum is met, but the new configuration is still invalid: a
+        // threshold of 0 would let a single (or no) signer authorize payouts.
+        let env = Env::default();
+        let signer1 = Address::generate(&env);
+        let signer2 = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let signers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
+
+        let contract_id = env.register(Multisig, ());
+        let client = MultisigClient::new(&env, &contract_id);
+        client.init(&signers, &2u32, &token);
+
+        let approvers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
+        let replacement = Vec::from_array(&env, [Address::generate(&env)]);
+        client.mock_all_auths().set_signers(&approvers, &replacement, &0u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Threshold cannot exceed number of signers")]
+    fn test_rotation_rejects_threshold_exceeding_new_signers() {
+        let env = Env::default();
+        let signer1 = Address::generate(&env);
+        let signer2 = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let signers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
+
+        let contract_id = env.register(Multisig, ());
+        let client = MultisigClient::new(&env, &contract_id);
+        client.init(&signers, &2u32, &token);
+
+        // Quorum met (2-of-2), but the rotated config demands 3 approvals
+        // from a 1-signer set — invalid.
+        let approvers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
+        let replacement = Vec::from_array(&env, [signer1.clone()]);
+        client.mock_all_auths().set_signers(&approvers, &replacement, &3u32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Duplicate signers are not allowed")]
+    fn test_rotation_rejects_duplicate_new_signers() {
+        let env = Env::default();
+        let signer1 = Address::generate(&env);
+        let signer2 = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        let signers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
+
+        let contract_id = env.register(Multisig, ());
+        let client = MultisigClient::new(&env, &contract_id);
+        client.init(&signers, &2u32, &token);
+
+        // Quorum met, but the rotated signer set contains a duplicate — a
+        // single address counting twice would let one key dominate the set.
+        let approvers = Vec::from_array(&env, [signer1.clone(), signer2.clone()]);
+        let duplicated = Vec::from_array(&env, [signer1.clone(), signer1.clone()]);
+        client
+            .mock_all_auths()
+            .set_signers(&approvers, &duplicated, &2u32);
+    }
 }

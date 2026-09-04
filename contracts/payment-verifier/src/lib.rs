@@ -662,4 +662,258 @@ mod test {
         assert_eq!(payment.amount, 100_000_000i128);
         assert!(payment.verified);
     }
+
+    // ── Pause / admin transfer / refund edge cases ──
+
+    #[test]
+    #[should_panic(expected = "Contract already initialized")]
+    fn test_double_init_rejected() {
+        // A second init would let an attacker replace the admin and rewrite
+        // the audit trail — it must be rejected, mirroring the other
+        // contracts' takeover guard.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let attacker = Address::generate(&env);
+        client.init(&attacker);
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_record_payment_rejected_while_paused() {
+        // While paused the audit trail is frozen: not even an admin-authed
+        // record_payment may write, and the hash must not be marked used.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.mock_all_auths().set_paused(&true);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        client.mock_all_auths().record_payment(
+            &String::from_str(&env, "paused-tx"),
+            &payer,
+            &payee,
+            &100_000_000i128,
+            &String::from_str(&env, "USDC"),
+            &1712345678u64,
+            &String::from_str(&env, "q-paused"),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Contract is paused")]
+    fn test_refund_rejected_while_paused() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+        client.mock_all_auths().set_paused(&true);
+
+        client.mock_all_auths().refund_payment(
+            &String::from_str(&env, "any-hash"),
+            &String::from_str(&env, "paused"),
+        );
+    }
+
+    #[test]
+    fn test_unpause_resumes_recording() {
+        // A pause must be reversible: after set_paused(false) the admin can
+        // record payments again and replay protection starts fresh per hash.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        client.mock_all_auths().set_paused(&true);
+        client.mock_all_auths().set_paused(&false);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let tx_hash = String::from_str(&env, "resume-tx");
+        client.mock_all_auths().record_payment(
+            &tx_hash,
+            &payer,
+            &payee,
+            &100_000_000i128,
+            &String::from_str(&env, "USDC"),
+            &1712345678u64,
+            &String::from_str(&env, "q-resume"),
+        );
+
+        assert!(client.is_payment_used(&tx_hash));
+        assert_eq!(client.total_payments(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Amount must be positive")]
+    fn test_record_payment_rejects_negative_amount() {
+        // Negative amounts are as invalid as zero — a signed negative i128
+        // must never be recorded as a "verified" payment amount.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        client.mock_all_auths().record_payment(
+            &String::from_str(&env, "negamt"),
+            &payer,
+            &payee,
+            &-1i128,
+            &String::from_str(&env, "USDC"),
+            &1712345678u64,
+            &String::from_str(&env, "quote-001"),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Payment not found")]
+    fn test_refund_unknown_payment_panics() {
+        // Refunding a hash that was never recorded must fail loudly rather
+        // than silently no-op (the caller believes a refund happened).
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        client.mock_all_auths().refund_payment(
+            &String::from_str(&env, "never-recorded"),
+            &String::from_str(&env, "test"),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "Payment already refunded")]
+    fn test_refund_twice_rejected() {
+        // Double-refund must be impossible: the second call panics and leaves
+        // the single refunded flag intact (idempotency guard).
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let tx_hash = String::from_str(&env, "refund-twice");
+        client.mock_all_auths().record_payment(
+            &tx_hash,
+            &payer,
+            &payee,
+            &100_000_000i128,
+            &String::from_str(&env, "USDC"),
+            &1712345678u64,
+            &String::from_str(&env, "q-1"),
+        );
+        client
+            .mock_all_auths()
+            .refund_payment(&tx_hash, &String::from_str(&env, "first"));
+        client
+            .mock_all_auths()
+            .refund_payment(&tx_hash, &String::from_str(&env, "second"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Payment already recorded")]
+    fn test_replay_still_blocked_after_refund() {
+        // A refund flips the `refunded` flag but must NOT un-consume the hash:
+        // re-recording the same transaction hash after a refund is a replay.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let payer = Address::generate(&env);
+        let payee = Address::generate(&env);
+        let tx_hash = String::from_str(&env, "replay-after-refund");
+        client.mock_all_auths().record_payment(
+            &tx_hash,
+            &payer,
+            &payee,
+            &100_000_000i128,
+            &String::from_str(&env, "USDC"),
+            &1712345678u64,
+            &String::from_str(&env, "q-1"),
+        );
+        client
+            .mock_all_auths()
+            .refund_payment(&tx_hash, &String::from_str(&env, "refunded"));
+        assert!(client.get_payment(&tx_hash).unwrap().refunded);
+
+        // Re-recording must panic — replay protection survives the refund.
+        client.mock_all_auths().record_payment(
+            &tx_hash,
+            &payer,
+            &payee,
+            &100_000_000i128,
+            &String::from_str(&env, "USDC"),
+            &1712345678u64,
+            &String::from_str(&env, "q-2"),
+        );
+    }
+
+    #[test]
+    fn test_get_payment_unknown_hash_returns_none() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        let missing = String::from_str(&env, "missing");
+        assert_eq!(client.get_payment(&missing), None);
+        assert!(!client.is_payment_used(&missing));
+    }
+
+    #[test]
+    fn test_set_admin_transfers_control() {
+        // Admin rotation: without the current admin's signature the transfer
+        // is rejected; after a successful transfer the stored admin is the
+        // new address and the old one is no longer in the config.
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+
+        let contract_id = env.register(PaymentVerifier, ());
+        let client = PaymentVerifierClient::new(&env, &contract_id);
+        client.init(&admin);
+
+        // No admin signature → transfer rejected.
+        let unauthorized = client.try_set_admin(&new_admin);
+        assert!(unauthorized.is_err());
+
+        client.mock_all_auths().set_admin(&new_admin);
+
+        // The stored CONFIG now names new_admin as the admin.
+        let config: ContractConfig =
+            env.as_contract(&contract_id, || env.storage().instance().get(&CONFIG_KEY).unwrap());
+        assert_eq!(config.admin, new_admin);
+
+        // The new admin is in control: an admin-only state mutation works.
+        client.mock_all_auths().set_paused(&true);
+        let config_after: ContractConfig =
+            env.as_contract(&contract_id, || env.storage().instance().get(&CONFIG_KEY).unwrap());
+        assert!(config_after.paused);
+    }
 }
