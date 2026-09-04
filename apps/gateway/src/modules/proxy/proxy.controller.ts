@@ -19,7 +19,7 @@ import { AdminService } from '../admin/admin.service';
 import { WebhooksService } from '../webhooks/webhooks.service';
 import { RateLimitGuard } from '../../common/guards/rate-limit.guard';
 import { chatCompletionRequestSchema, txHashSchema } from '@x402/validation';
-import { calculatePrice, comparePayment } from '@x402/x402-core';
+import { calculatePrice, comparePayment, DEFAULT_TOKEN_ESTIMATE } from '@x402/x402-core';
 import { getConfig } from '@x402/config';
 import { logger } from '@x402/logger';
 import { generateId } from '@x402/shared';
@@ -112,10 +112,15 @@ export class ProxyController {
         process.env[`UPSTREAM_API_KEY_${route.providerId.toUpperCase().replace(/-/g, '_')}`];
       const payment = await this.paymentsService.findByTxHash(txHash);
 
+      // 6. Bound per-token completions to what the deposit covers (see
+      //    capForwardBody): never forward an uncapped request whose deposit
+      //    was estimated from the default token budget.
+      const forwardBody = this.capForwardBody(body, route, payment);
+
       if (body.stream) {
         return this.handleStreamingForward(
           res,
-          body,
+          forwardBody,
           route,
           txHash,
           upstreamApiKey,
@@ -127,7 +132,7 @@ export class ProxyController {
 
       return this.handleNonStreamingForward(
         res,
-        body,
+        forwardBody,
         route,
         txHash,
         upstreamApiKey,
@@ -155,6 +160,40 @@ export class ProxyController {
   }
 
   // ── Helper methods ───────────────────────────
+
+  /**
+   * Cap the forwarded completion length for per-token routes.
+   *
+   * Per-token deposits are estimated from `max_tokens` (or a default budget
+   * when the client omits it). If the client omitted `max_tokens`, an
+   * uncapped upstream response could generate far more completion tokens than
+   * the deposit covers — so forward with `max_tokens` set to exactly the
+   * budget the deposit was estimated from. Clients that supplied their own
+   * `max_tokens` are already bounded server-side and pass through untouched.
+   *
+   * Note: this bounds completion tokens; prompt tokens are still unbounded
+   * and still billed, which the underpayment debt gate (verifyAndConfirm
+   * Payment) exists to enforce.
+   */
+  private capForwardBody(
+    body: ChatCompletionRequest,
+    route: RouteConfig,
+    payment: PaymentRecord | null,
+  ): ChatCompletionRequest {
+    if (route.pricingModel !== 'per_token' || body.max_tokens !== undefined) return body;
+
+    // The quote used for this payment carries the exact estimate the deposit
+    // was based on (falls back to the shared default for payment rows whose
+    // receipt was written before the field existed).
+    const quote = payment?.receiptJson ? (payment.receiptJson as Quote) : null;
+    const budget = quote?.estimatedMaxTokens ?? DEFAULT_TOKEN_ESTIMATE;
+    logger.info('Capping forwarded max_tokens to deposit estimate', {
+      model: body.model,
+      max_tokens: budget,
+      pricingModel: route.pricingModel,
+    });
+    return { ...body, max_tokens: budget };
+  }
 
   /**
    * Send a 402 Payment Required response.
@@ -314,6 +353,76 @@ export class ProxyController {
         message: `Payment verification failed: ${verification.failureReason}`,
       });
       return false;
+    }
+
+    // ── Underpayment debt gate (per-token enforcement) ────────────
+    //
+    // A payer with open underpayment debt on this provider must top up before
+    // receiving further LLM access. The arriving on-chain payment must cover
+    // the current quote deposit PLUS all outstanding debt; the surplus over
+    // the deposit is the debt repayment and clears the ledger. When the
+    // payment is insufficient we answer 402 with a quote for the combined
+    // amount so the SDK auto-pays the top-up in a single transaction.
+    //
+    // Quotes always carry the pure deposit (never the debt), so the same
+    // deposit basis is used here and in the metered settlement below. The
+    // refused payment is deliberately not claimed — it stays on-chain to the
+    // provider (the protocol has no refund path) and its hash is already
+    // consumed by Redis/on-chain replay protection, so it cannot be replayed.
+    const openDebt = await this.paymentsService.getOpenDebtTotal(
+      verification.payerAddress,
+      route.providerId,
+    );
+    if (openDebt > 0n) {
+      const deposit = BigInt(quoteForVerification.amount);
+      const requiredTotal = deposit + openDebt;
+      if (BigInt(verification.amount) < requiredTotal) {
+        logger.warn('Underpayment debt outstanding — access denied until topped up', {
+          traceId,
+          txHash,
+          payerAddress: verification.payerAddress,
+          providerId: route.providerId,
+          debt: openDebt.toString(),
+          paid: verification.amount,
+          requiredTotal: requiredTotal.toString(),
+        });
+
+        await this.adminService.writeAuditLog({
+          action: 'payment_debt_denied',
+          entity: 'payment',
+          entityId: txHash,
+          providerId: route.providerId,
+          actor: verification.payerAddress,
+          details: {
+            debt: openDebt.toString(),
+            paid: verification.amount,
+            requiredTotal: requiredTotal.toString(),
+            route: route.path,
+            traceId,
+          },
+        });
+
+        // Fresh deposit quote, amount bumped to deposit + debt so the client
+        // SDK pays the top-up in one transaction.
+        const baseQuote = await this.x402Service.generateQuoteForRoute(route);
+        const topUpQuote: Quote = { ...baseQuote, amount: requiredTotal.toString() };
+        const debtRequiredResponse = await this.x402Service.build402Response(topUpQuote);
+        res.status(402).json(debtRequiredResponse);
+        return false;
+      }
+
+      // Payment covers deposit + debt → the surplus is the repayment.
+      await this.paymentsService.settleUnderpaymentDebts(
+        verification.payerAddress,
+        route.providerId,
+      );
+      logger.info('Underpayment debt settled by top-up payment', {
+        traceId,
+        txHash,
+        payerAddress: verification.payerAddress,
+        providerId: route.providerId,
+        debt: openDebt.toString(),
+      });
     }
 
     // Atomically claim the payment. `confirmPayment` returns null when a
@@ -617,6 +726,20 @@ export class ProxyController {
         paidAmount,
         shortfall: comparison.surplus,
       });
+
+      // Record the deficit as open debt so future access from this payer on
+      // this provider is gated until topped up (see the debt gate in
+      // verifyAndConfirmPayment). The response is already delivered — this
+      // ledger is what makes the underpayment recoverable on the next visit.
+      if (payment?.payerAddress) {
+        await this.paymentsService.recordUnderpaymentDebt({
+          quoteId: payment.quoteId,
+          providerId: route.providerId,
+          routeId: route.id,
+          payerAddress: payment.payerAddress,
+          amount: comparison.surplus.replace('-', ''), // deficit = −surplus
+        });
+      }
     }
 
     // Escrow settlement: charge actual cost + refund surplus from the

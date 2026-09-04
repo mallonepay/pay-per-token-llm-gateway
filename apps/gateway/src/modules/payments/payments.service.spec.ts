@@ -17,6 +17,11 @@ jest.mock('@x402/database', () => ({
     provider: {
       findFirst: jest.fn(),
     },
+    underpaymentDebt: {
+      create: jest.fn(),
+      aggregate: jest.fn(),
+      updateMany: jest.fn(),
+    },
   },
 }));
 
@@ -318,6 +323,119 @@ describe('PaymentsService', () => {
       await service.recordActualCost('missing-quote', '100', 1);
 
       expect(mockPrisma.payment.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('recordUnderpaymentDebt', () => {
+    it('creates an open debt row for a positive deficit', async () => {
+      (mockPrisma.underpaymentDebt.create as jest.Mock).mockResolvedValue({ id: 'debt-1' });
+
+      await service.recordUnderpaymentDebt({
+        quoteId: 'quote-1',
+        providerId: 'provider-1',
+        routeId: 'route-1',
+        payerAddress: 'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL',
+        amount: '250000',
+      });
+
+      expect(mockPrisma.underpaymentDebt.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          quoteId: 'quote-1',
+          providerId: 'provider-1',
+          amount: BigInt('250000'),
+          status: 'open',
+        }),
+      });
+    });
+
+    it('does nothing for a zero or negative deficit', async () => {
+      await service.recordUnderpaymentDebt({
+        quoteId: 'quote-1',
+        providerId: 'provider-1',
+        routeId: 'route-1',
+        payerAddress: 'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL',
+        amount: '0',
+      });
+      await service.recordUnderpaymentDebt({
+        quoteId: 'quote-2',
+        providerId: 'provider-1',
+        routeId: 'route-1',
+        payerAddress: 'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL',
+        amount: '-100',
+      });
+
+      expect(mockPrisma.underpaymentDebt.create).not.toHaveBeenCalled();
+    });
+
+    it('swallows duplicate-quote errors (unique constraint)', async () => {
+      const violation = new Error('Unique constraint failed on the fields: (`quoteId`)');
+      (mockPrisma.underpaymentDebt.create as jest.Mock).mockRejectedValue(violation);
+
+      await expect(
+        service.recordUnderpaymentDebt({
+          quoteId: 'quote-1',
+          providerId: 'provider-1',
+          routeId: 'route-1',
+          payerAddress: 'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL',
+          amount: '250000',
+        }),
+      ).resolves.toBeUndefined();
+    });
+  });
+
+  describe('getOpenDebtTotal', () => {
+    it('returns the summed open debt for a payer on a provider', async () => {
+      (mockPrisma.underpaymentDebt.aggregate as jest.Mock).mockResolvedValue({
+        _sum: { amount: BigInt('500000') },
+      });
+
+      const total = await service.getOpenDebtTotal(
+        'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL',
+        'provider-1',
+      );
+
+      expect(total).toBe(BigInt('500000'));
+      expect(mockPrisma.underpaymentDebt.aggregate).toHaveBeenCalledWith({
+        where: {
+          payerAddress: 'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL',
+          providerId: 'provider-1',
+          status: 'open',
+        },
+        _sum: { amount: true },
+      });
+    });
+
+    it('returns 0n when there is no open debt', async () => {
+      (mockPrisma.underpaymentDebt.aggregate as jest.Mock).mockResolvedValue({
+        _sum: { amount: null },
+      });
+
+      const total = await service.getOpenDebtTotal(
+        'GA5ZSE6VKPVFLEXMWJQBGHE4FJHKQIFSJMLQ7H4VFQB4UHLEH5IOVK3F',
+        'provider-1',
+      );
+      expect(total).toBe(0n);
+    });
+  });
+
+  describe('settleUnderpaymentDebts', () => {
+    it('marks all open debt settled for a payer on a provider', async () => {
+      (mockPrisma.underpaymentDebt.updateMany as jest.Mock).mockResolvedValue({ count: 2 });
+
+      const cleared = await service.settleUnderpaymentDebts(
+        'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL',
+        'provider-1',
+      );
+
+      expect(cleared).toBe(2);
+      expect(mockPrisma.underpaymentDebt.updateMany).toHaveBeenCalledWith({
+        where: {
+          payerAddress: 'GB4YJON6574K74SGHSKHPMBJDJPLBPYN4HPGGN2J5RFKMSNFSWLBYFRL',
+          providerId: 'provider-1',
+          status: 'open',
+        },
+        data: expect.objectContaining({ status: 'settled' }),
+      });
     });
   });
 

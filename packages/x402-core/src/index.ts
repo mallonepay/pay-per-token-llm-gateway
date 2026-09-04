@@ -32,7 +32,7 @@ export interface QuoteGeneratorOptions {
 }
 
 /** Default token estimate when max_tokens is not specified */
-const DEFAULT_TOKEN_ESTIMATE = 4096;
+export const DEFAULT_TOKEN_ESTIMATE = 4096;
 
 /**
  * Generate a payment quote for a given route configuration.

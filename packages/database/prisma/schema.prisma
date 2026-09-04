@@ -25,6 +25,7 @@ model Provider {
   payments             Payment[]
   notifications        Notification[]
   prepaidCredits       PrepaidCredit[]
+  underpaymentDebts    UnderpaymentDebt[]
 
   @@index([walletAddress])
   @@index([active])
@@ -97,6 +98,32 @@ model Wallet {
   prepaidCredit PrepaidCredit?
 
   @@index([address])
+}
+
+// ── Underpayment Debts (per-token enforcement) ─
+//
+// Records the deficit when a per-token request's actual cost (usage tokens ×
+// per-token price) exceeds the deposit the payer sent. A payer with open debt
+// on a provider must top up (pay deposit + debt in one transaction) before the
+// gateway grants further access on that provider.
+
+model UnderpaymentDebt {
+  id           String   @id @default(uuid())
+  providerId   String
+  payerAddress String
+  /// Quote whose metered cost exceeded its deposit. Unique — one debt per quote.
+  quoteId      String   @unique
+  routeId      String
+  /// Deficit in stroops (actualCost − deposit), always > 0.
+  amount       BigInt
+  status       String   @default("open") // open | settled
+  createdAt    DateTime @default(now())
+  settledAt    DateTime?
+
+  provider     Provider @relation(fields: [providerId], references: [id], onDelete: Cascade)
+
+  @@index([payerAddress, providerId, status])
+  @@index([providerId, status])
 }
 
 // ── Prepaid Credits (v2) ─────────────────────
