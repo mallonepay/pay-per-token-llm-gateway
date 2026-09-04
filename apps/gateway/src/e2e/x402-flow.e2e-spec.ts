@@ -175,6 +175,13 @@ jest.mock('@x402/database', () => ({
       }),
       aggregate: jest.fn().mockResolvedValue({ _sum: { amount: null } }),
     },
+    // Default: no open debt, so the underpayment debt gate is a no-op unless
+    // a scenario explicitly seeds debt.
+    underpaymentDebt: {
+      aggregate: jest.fn().mockResolvedValue({ _sum: { amount: null } }),
+      create: jest.fn().mockResolvedValue({}),
+      updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+    },
     auditLog: {
       findMany: jest.fn().mockResolvedValue([]),
       count: jest.fn().mockResolvedValue(0),
