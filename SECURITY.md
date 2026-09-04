@@ -29,7 +29,7 @@ Transaction hashes are tracked in Redis (or PostgreSQL) with a TTL. The same tra
 
 ### Rate Limiting
 
-Unpaid 402 requests are rate-limited by caller IP or wallet address. This prevents quote-spam and resource exhaustion attacks.
+Unpaid 402 requests are rate-limited by caller IP address (wallet-address-based rate limiting is not yet implemented). This prevents quote-spam and resource exhaustion attacks.
 
 ### Key Management
 

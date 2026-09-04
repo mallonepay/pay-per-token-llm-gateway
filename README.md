@@ -29,6 +29,14 @@
   <img src="https://img.shields.io/badge/License-MIT-blue" alt="License MIT" />
 </p>
 
+> ### ⚠️ Network status: **Testnet only** — not mainnet-ready
+>
+> Payments use **testnet USDC with no real value**. A Stellar mainnet launch
+> is gated by the items in **[`MAINNET_READINESS.md`](./MAINNET_READINESS.md)** —
+> most critically an **independent contract audit** (the Soroban contracts
+> are self-tested; no external audit has been completed) and a fresh
+> **mainnet contract deployment**.
+
 ---
 
 ## What is x402?
@@ -581,13 +589,31 @@ See [DEPLOYMENT.md](./DEPLOYMENT.md) for the complete step-by-step guide.
 
 ## 🛡️ Security
 
+### Audit Status
+
+**Self-tested — external audit pending.** No third-party firm has audited the
+Soroban contracts or the gateway as of September 2026. The in-repo
+[`AUDIT.md`](./AUDIT.md) is an automated self-audit; its actionable findings
+have been fixed. See [`MAINNET_READINESS.md`](./MAINNET_READINESS.md) for the
+go/no-go gate and what a mainnet launch requires first.
+
 ### Trust Model
 
 - **Blockchain as source of truth** — All payments verified on-chain via Horizon
 - **Zero trust for clients** — Client-submitted payment proofs are never trusted
 - **Server-side API keys** — Upstream LLM keys are never exposed to callers
-- **Replay protection** — Every transaction hash tracked; double-use rejected
-- **Rate limiting** — Unpaid requests are throttled per IP/wallet
+- **Single-use payments** — Every payment hash is consumed atomically (DB
+  claim + Redis replay guard + on-chain guard); double-use is rejected
+- **Rate limiting** — Unpaid requests are throttled **per IP** (the original
+  "per IP or wallet" wording overstated this)
+
+### Threat Model
+
+| Threat                                              | What could go wrong                                                                                                                                                                                                                                                                                                  | Status                                                                                                                                                                                                                                                                                                                            |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Horizon unavailable during payment verification** | The gateway reads payment state from Horizon. If Horizon errors or times out at verify time, the request fails with a 5xx — valid payments are never falsely accepted, but legitimate traffic is blocked for the duration of the outage.                                                                             | **Mitigated (fail-closed)** — no false acceptance. Open availability exposure: run dedicated Horizon/Soroban RPC providers with API keys and alert on verification-failure spikes.                                                                                                                                                |
+| **Replay across testnet/mainnet passphrases**       | A testnet payment replayed on mainnet to obtain paid LLM access. Impossible at the protocol level: Stellar signatures and transaction hashes are scoped to the network passphrase, and the replay guards (DB, Redis, on-chain) are per deployment.                                                                   | **Mitigated at the protocol level.** Residual risk is operator **config drift** — a mainnet gateway pointed at testnet RPC would verify worthless testnet payments. A runtime assertion pairing `STELLAR_NETWORK=mainnet` with mainnet endpoints/passphrase is recommended (see "Network & replay risk" in MAINNET_READINESS.md). |
+| **Quote front-running**                             | An observer grabs a victim's 402 quote and pays the payment address first, consuming the quote and forcing the victim to re-quote. Quotes and payment hashes are single-use (atomic DB claim + Redis), and the quote memo is attribution-only — it is not enforced, so a third party _can_ pay someone else's quote. | **Partially mitigated.** The payment lands in the provider's account — the attacker pays real funds and receives nothing — so this is griefing/DoS rather than theft; the victim simply re-quotes. Memo enforcement is deliberately off to keep the SDK's retry flow working.                                                     |
 
 ### Production Checklist
 
