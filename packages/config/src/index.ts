@@ -186,6 +186,25 @@ const INSECURE_JWT_SECRETS = [
 ];
 
 /**
+ * Throw when the dev auth bypass would be active in production.
+ *
+ * AUTH_DEV_MODE accepts `dev-sig-` signatures that authenticate as ANY
+ * wallet. If it were left on in a production deploy, anyone who learned the
+ * convention could impersonate any provider wallet. Same fail-fast rationale
+ * as the JWT placeholder check — refuse to boot rather than run with the
+ * bypass enabled.
+ */
+function assertNoDevAuthInProduction(nodeEnv: string): void {
+  if (nodeEnv === 'production' && process.env.AUTH_DEV_MODE === 'true') {
+    throw new Error(
+      'AUTH_DEV_MODE=true is set but NODE_ENV=production. ' +
+        'AUTH_DEV_MODE accepts dev-sig- signatures as any wallet and must never ' +
+        'run in production. Set AUTH_DEV_MODE=false.',
+    );
+  }
+}
+
+/**
  * Validate that required environment variables are set.
  * Call this at startup to fail fast with clear error messages.
  */
@@ -217,6 +236,9 @@ export function validateEnv(): void {
       'JWT_SECRET is set to a known insecure placeholder. Generate a real secret with: openssl rand -base64 32',
     );
   }
+
+  // Never boot a production gateway with the dev auth bypass enabled.
+  assertNoDevAuthInProduction(process.env.NODE_ENV || 'development');
 
   const missing = required.filter((r) => !r.value);
   if (missing.length > 0) {
@@ -295,6 +317,10 @@ export function loadConfig(): GatewayConfig {
       );
     }
   }
+
+  // Same guard as validateEnv — getConfig()/loadConfig() must also fail fast
+  // if the dev auth bypass would be active in production.
+  assertNoDevAuthInProduction(nodeEnv);
 
   return {
     port: parseInt(process.env.PORT || '3000', 10),

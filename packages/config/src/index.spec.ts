@@ -47,6 +47,23 @@ describe('config security hardening', () => {
       expect(() => loadConfig()).not.toThrow();
     });
 
+    it('throws when AUTH_DEV_MODE=true is set in production', () => {
+      process.env.NODE_ENV = 'production';
+      process.env.JWT_SECRET = 'a-real-random-256-bit-secret';
+      process.env.AUTH_DEV_MODE = 'true';
+
+      expect(() => loadConfig()).toThrow(/AUTH_DEV_MODE/);
+    });
+
+    it('accepts AUTH_DEV_MODE=true outside production', () => {
+      process.env.NODE_ENV = 'development';
+      process.env.JWT_SECRET = 'a-real-random-256-bit-secret';
+      process.env.AUTH_DEV_MODE = 'true';
+
+      expect(() => loadConfig()).not.toThrow();
+      expect(loadConfig().security.authDevMode).toBe(true);
+    });
+
     it('accepts a real secret and reads AUTH_DEV_MODE / TRUST_PROXY from the environment', () => {
       process.env.NODE_ENV = 'test';
       process.env.JWT_SECRET = 'a-real-random-256-bit-secret';
@@ -189,6 +206,26 @@ describe('config security hardening', () => {
       process.env.REDIS_URL = '${{Redis.REDIS_URL}}';
 
       expect(() => validateEnv()).toThrow(/REDIS_URL/);
+    });
+
+    it('rejects AUTH_DEV_MODE=true in production', () => {
+      process.env.NODE_ENV = 'production';
+      process.env.JWT_SECRET = 'a-real-random-256-bit-secret';
+      process.env.DATABASE_URL = 'postgres://db.example.com:5432/x402';
+      process.env.REDIS_URL = 'redis://redis.example.com:6379';
+      process.env.AUTH_DEV_MODE = 'true';
+
+      expect(() => validateEnv()).toThrow(/AUTH_DEV_MODE/);
+    });
+
+    it('allows AUTH_DEV_MODE=true in development', () => {
+      process.env.NODE_ENV = 'development';
+      process.env.JWT_SECRET = 'a-real-random-256-bit-secret';
+      process.env.DATABASE_URL = 'postgres://localhost:5432/db';
+      process.env.REDIS_URL = 'redis://localhost:6379';
+      process.env.AUTH_DEV_MODE = 'true';
+
+      expect(() => validateEnv()).not.toThrow();
     });
 
     it('accepts a real Redis URL in production', () => {
