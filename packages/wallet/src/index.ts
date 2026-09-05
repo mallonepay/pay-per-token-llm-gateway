@@ -212,10 +212,13 @@ export async function getAccountBalances(
 ): Promise<Array<{ asset: string; balance: string; issuer?: string }>> {
   try {
     const account = await server.loadAccount(address);
-    return account.balances.map((b: any) => ({
-      asset: b.asset_type === 'native' ? 'XLM' : b.asset_code,
+    return account.balances.map((b: Horizon.HorizonApi.BalanceLine) => ({
+      asset: b.asset_type === 'native' ? 'XLM' : (b as Horizon.HorizonApi.BalanceLineAsset).asset_code,
       balance: b.balance,
-      issuer: b.asset_issuer,
+      issuer:
+        b.asset_type === 'native'
+          ? undefined
+          : (b as Horizon.HorizonApi.BalanceLineAsset).asset_issuer,
     }));
   } catch {
     return [];
@@ -225,7 +228,10 @@ export async function getAccountBalances(
 /**
  * Lookup a transaction by hash.
  */
-export async function getTransaction(txHash: TxHash, server: Horizon.Server): Promise<any> {
+export async function getTransaction(
+  txHash: TxHash,
+  server: Horizon.Server,
+): Promise<Horizon.ServerApi.TransactionRecord | null> {
   try {
     return await server.transactions().transaction(txHash).call();
   } catch {
