@@ -7,6 +7,7 @@ import {
   getHorizonUrl,
   getSorobanRpcUrl,
   buildPaymentTransaction,
+  buildUnsignedPaymentTransaction,
   createHorizonServer,
   accountExists,
   getAccountBalances,
@@ -185,6 +186,75 @@ describe('buildPaymentTransaction', () => {
     await expect(
       buildPaymentTransaction(buildOptions({ sourceSecret: 'not-a-secret' })),
     ).rejects.toThrow(/invalid/i);
+  });
+});
+
+describe('buildUnsignedPaymentTransaction', () => {
+  function buildUnsignedOptions(overrides: Record<string, any> = {}): any {
+    return {
+      sourcePublicKey: SOURCE_PUBLIC,
+      destination: DEST_PUBLIC,
+      amount: '12.34',
+      asset: 'USDC',
+      assetIssuer: USDC_ISSUER,
+      memo: undefined,
+      network: 'testnet',
+      horizonUrl: HORIZON_URL,
+      ...overrides,
+    };
+  }
+
+  it('builds an unsigned USDC payment with memo and zero signatures', async () => {
+    const result = await buildUnsignedPaymentTransaction(
+      buildUnsignedOptions({ memo: 'unsigned-memo-1' }),
+    );
+
+    expect(result.txHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.txXdr).toMatch(/^[A-Za-z0-9+/=]+$/);
+    expect(loadAccountSpy).toHaveBeenCalledWith(SOURCE_PUBLIC);
+
+    const decoded = TransactionBuilder.fromXDR(result.txXdr, Networks.TESTNET) as any;
+    expect(decoded.hash().toString('hex')).toBe(result.txHash);
+    expect(decoded.source).toBe(SOURCE_PUBLIC);
+    expect(decoded.signatures).toHaveLength(0);
+
+    const op = decoded.operations[0];
+    expect(op.type).toBe('payment');
+    expect(op.destination).toBe(DEST_PUBLIC);
+    expect(parseFloat(op.amount)).toBe(12.34);
+    expect(op.asset.getCode()).toBe('USDC');
+    expect(op.asset.getIssuer()).toBe(USDC_ISSUER);
+
+    const memo = decoded.memo;
+    expect(memo.type).toBe('text');
+    expect(memo.value.toString()).toBe('unsigned-memo-1');
+  });
+
+  it('builds an unsigned native XLM payment', async () => {
+    const result = await buildUnsignedPaymentTransaction(
+      buildUnsignedOptions({ asset: 'XLM', assetIssuer: undefined }),
+    );
+
+    const decoded = TransactionBuilder.fromXDR(result.txXdr, Networks.TESTNET) as any;
+    const op = decoded.operations[0];
+    expect(op.type).toBe('payment');
+    expect(op.asset.isNative()).toBe(true);
+    expect(parseFloat(op.amount)).toBe(12.34);
+    expect(decoded.signatures).toHaveLength(0);
+  });
+
+  it('throws for USDC without an issuer', async () => {
+    await expect(
+      buildUnsignedPaymentTransaction(buildUnsignedOptions({ assetIssuer: undefined })),
+    ).rejects.toThrow('Unsupported asset or missing issuer: USDC');
+  });
+
+  it('throws for an unsupported asset', async () => {
+    await expect(
+      buildUnsignedPaymentTransaction(
+        buildUnsignedOptions({ asset: 'UNKNOWN', assetIssuer: 'GOTHER123' }),
+      ),
+    ).rejects.toThrow('Unsupported asset or missing issuer: UNKNOWN');
   });
 });
 
