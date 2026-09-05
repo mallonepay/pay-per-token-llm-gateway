@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { Keypair, TransactionBuilder, Horizon, Networks } from '@stellar/stellar-sdk';
+import { Keypair, TransactionBuilder, Horizon, Networks, BASE_FEE } from '@stellar/stellar-sdk';
 import {
   generateKeypair,
   keypairFromSecret,
@@ -185,6 +185,22 @@ describe('buildPaymentTransaction', () => {
     await expect(
       buildPaymentTransaction(buildOptions({ sourceSecret: 'not-a-secret' })),
     ).rejects.toThrow(/invalid/i);
+  });
+});
+
+describe('transaction fee', () => {
+  it('defaults to the Stellar BASE_FEE', async () => {
+    const result = await buildPaymentTransaction(buildOptions());
+    const decoded = TransactionBuilder.fromXDR(result.txXdr, Networks.TESTNET) as any;
+    expect(decoded.fee).toBe(String(BASE_FEE));
+  });
+});
+
+describe('Horizon error handling', () => {
+  it('propagates a clear error when the source account cannot be loaded', async () => {
+    loadAccountSpy.mockRejectedValue(new Error('Account not found'));
+
+    await expect(buildPaymentTransaction(buildOptions())).rejects.toThrow('Account not found');
   });
 });
 
