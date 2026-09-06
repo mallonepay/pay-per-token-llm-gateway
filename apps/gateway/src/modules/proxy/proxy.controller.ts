@@ -83,10 +83,14 @@ export class ProxyController {
         });
       }
 
-      // 3. Check for payment header. When present it must be a well-formed
-      // 64-char hex transaction hash — reject garbage (and multi-value header
-      // arrays) before it reaches Redis keys or Horizon URL paths.
+      // 3. Check for payment headers.
+      //    - X-Payment-Hash: a 64-char hex Horizon transaction hash (per-request payment)
+      //    - X-Escrow-User: a Stellar address that has prepaid credit in the
+      //      credit-escrow contract. When the balance covers the quote amount,
+      //      Horizon payment verification is skipped.
       const txHash = req.headers['x-payment-hash'] as string | undefined;
+      const escrowUser = req.headers['x-escrow-user'] as string | undefined;
+
       if (txHash !== undefined) {
         const txParse = txHashSchema.safeParse(txHash);
         if (!txParse.success) {
@@ -97,20 +101,29 @@ export class ProxyController {
           });
         }
       }
-      if (!txHash) {
+
+      if (!txHash && !escrowUser) {
         return this.handle402Response(res, route, traceId, model, body);
       }
 
-      // 4. Verify payment (includes cross-route replay protection)
-      const verified = await this.verifyAndConfirmPayment(txHash, route, res, traceId);
-      if (!verified) {
-        return; // 402 error response already sent
+      // 4. Verify payment (Horizon txHash or escrow balance)
+      let payment: PaymentRecord | null = null;
+      if (txHash) {
+        const verified = await this.verifyAndConfirmPayment(txHash, route, res, traceId);
+        if (!verified) {
+          return; // 402 error response already sent
+        }
+        payment = await this.paymentsService.findByTxHash(txHash);
+      } else if (escrowUser) {
+        payment = await this.verifyAndConfirmEscrowPayment(escrowUser, route, res, traceId, body);
+        if (!payment) {
+          return; // 402 error response already sent
+        }
       }
 
       // 5. Resolve upstream API key
       const upstreamApiKey =
         process.env[`UPSTREAM_API_KEY_${route.providerId.toUpperCase().replace(/-/g, '_')}`];
-      const payment = await this.paymentsService.findByTxHash(txHash);
 
       // 6. Bound per-token completions to what the deposit covers (see
       //    capForwardBody): never forward an uncapped request whose deposit
@@ -122,7 +135,7 @@ export class ProxyController {
           res,
           forwardBody,
           route,
-          txHash,
+          payment?.txHash || '',
           upstreamApiKey,
           payment,
           traceId,
@@ -134,7 +147,7 @@ export class ProxyController {
         res,
         forwardBody,
         route,
-        txHash,
+        payment?.txHash || '',
         upstreamApiKey,
         payment,
         traceId,
@@ -475,6 +488,81 @@ export class ProxyController {
       );
 
     return true;
+  }
+
+  /**
+   * Verify a prepaid escrow balance and confirm it as payment.
+   *
+   * Generates an internal quote so the payment record and settlement path
+   * can be reused. Returns the confirmed PaymentRecord on success, or null
+   * when the balance is insufficient (a 402 has already been sent).
+   */
+  private async verifyAndConfirmEscrowPayment(
+    escrowUser: string,
+    route: RouteConfig,
+    res: Response,
+    traceId: string,
+    body: ChatCompletionRequest,
+  ): Promise<PaymentRecord | null> {
+    logger.info('Verifying escrow payment', { traceId, escrowUser: escrowUser.slice(0, 8) });
+
+    const estimatedTokens =
+      route.pricingModel === 'per_token' ? body.max_tokens || undefined : undefined;
+    const quote = await this.x402Service.generateQuoteForRoute(route, estimatedTokens);
+    const verification = await this.x402Service.verifyEscrowPayment(escrowUser, quote);
+
+    if (!verification.verified) {
+      logger.warn('Escrow verification failed', {
+        traceId,
+        escrowUser: escrowUser.slice(0, 8),
+        reason: verification.failureReason,
+      });
+
+      // Build a 402 response so the caller can fall back to per-request payment.
+      const payment402 = await this.x402Service.build402Response(quote);
+      await this.paymentsService.createPendingPayment(quote, route);
+      await this.analyticsService.recordUnpaidRequest(route.path, route.providerId);
+
+      res.status(402).json({
+        ...payment402,
+        message: `Escrow payment failed: ${verification.failureReason}. ${payment402.message}`,
+      });
+      return null;
+    }
+
+    // Create and confirm a synthetic payment record for this escrow draw.
+    await this.paymentsService.createPendingPayment(quote, route);
+    const claimResult = await this.paymentsService.confirmPayment(quote.id, verification);
+
+    if (!claimResult) {
+      logger.warn('Escrow replay attempt (claim lost to concurrent request)', {
+        traceId,
+        escrowUser: escrowUser.slice(0, 8),
+        quoteId: quote.id,
+      });
+      res.status(402).json({
+        status: 402,
+        error: 'Payment Required',
+        message: 'This escrow quote has already been used. Please request a new quote.',
+      });
+      return null;
+    }
+
+    await this.adminService.writeAuditLog({
+      action: 'escrow_payment_verified',
+      entity: 'payment',
+      entityId: quote.id,
+      providerId: route.providerId,
+      actor: escrowUser,
+      details: {
+        amount: verification.amount,
+        asset: verification.asset,
+        route: route.path,
+        traceId,
+      },
+    });
+
+    return this.paymentsService.findByQuoteId(quote.id);
   }
 
   /**

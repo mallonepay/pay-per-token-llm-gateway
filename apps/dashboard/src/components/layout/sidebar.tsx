@@ -10,6 +10,7 @@ import {
   Settings,
   Webhook,
   Shield,
+  Vault,
 } from 'lucide-react';
 
 const links = [
@@ -18,6 +19,7 @@ const links = [
   { href: '/payments', label: 'Payments', icon: DollarSign },
   { href: '/audit', label: 'Audit Log', icon: FileText },
   { href: '/webhooks', label: 'Webhooks', icon: Webhook },
+  { href: '/escrow', label: 'Escrow', icon: Vault },
   { href: '/settings', label: 'Settings', icon: Settings },
 ];
 
