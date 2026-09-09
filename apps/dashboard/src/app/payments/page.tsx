@@ -1,10 +1,20 @@
 'use client';
 
-import { ExternalLink, Copy, Check, Loader2 } from 'lucide-react';
+import { ExternalLink, Copy, Check } from 'lucide-react';
 import { useState } from 'react';
 import { usePayments } from '@/lib/hooks';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { TableSkeleton } from '@/components/Skeleton';
 
 export default function PaymentsPage() {
+  return (
+    <ErrorBoundary>
+      <PaymentsPageContent />
+    </ErrorBoundary>
+  );
+}
+
+function PaymentsPageContent() {
   const [page, setPage] = useState(1);
   const [copied, setCopied] = useState<string | null>(null);
   const { data, isLoading, isError, error, isFetching } = usePayments({ page, limit: 20 });
@@ -63,9 +73,8 @@ export default function PaymentsPage() {
 
       <div className="card overflow-hidden">
         {isLoading ? (
-          <div className="flex flex-col items-center justify-center py-12 gap-3">
-            <Loader2 className="w-8 h-8 text-green-400 animate-spin" />
-            <p className="text-sm text-muted-foreground">Loading payments...</p>
+          <div className="card">
+            <TableSkeleton rows={5} columns={5} />
           </div>
         ) : payments.length === 0 ? (
           <p className="text-muted-foreground text-sm py-8 text-center">No payments yet</p>

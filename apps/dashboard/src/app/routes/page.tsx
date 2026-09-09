@@ -10,8 +10,18 @@ import {
   useDeleteRoute,
 } from '@/lib/hooks';
 import type { RouteResponse } from '@/lib/api';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { TableSkeleton } from '@/components/Skeleton';
 
 export default function RoutesPage() {
+  return (
+    <ErrorBoundary>
+      <RoutesPageContent />
+    </ErrorBoundary>
+  );
+}
+
+function RoutesPageContent() {
   const [showAdd, setShowAdd] = useState(false);
   const { data: routes, isLoading, isError, error, refetch } = useRoutes();
   const deleteMutation = useDeleteRoute();
@@ -126,9 +136,8 @@ export default function RoutesPage() {
 
       <div className="card overflow-hidden">
         {isLoading ? (
-          <div className="flex flex-col items-center justify-center py-12 gap-3">
-            <Loader2 className="w-8 h-8 text-green-400 animate-spin" />
-            <p className="text-sm text-muted-foreground">Loading routes...</p>
+          <div className="card">
+            <TableSkeleton rows={5} columns={6} />
           </div>
         ) : routeList.length === 0 ? (
           <p className="text-muted-foreground text-sm py-8 text-center">

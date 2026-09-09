@@ -1,12 +1,21 @@
 'use client';
 
-import { Plus, Globe, Loader2, AlertTriangle, Send, CheckCircle } from 'lucide-react';
+import { Plus, Globe, AlertTriangle, Send, CheckCircle } from 'lucide-react';
 import { useState } from 'react';
 import { sendWebhookTest } from '@/lib/api';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
 
 const SUPPORTED_EVENTS = ['payment_received', 'request_forwarded', 'verification_failed'] as const;
 
 export default function WebhooksPage() {
+  return (
+    <ErrorBoundary>
+      <WebhooksPageContent />
+    </ErrorBoundary>
+  );
+}
+
+function WebhooksPageContent() {
   const [showAdd, setShowAdd] = useState(false);
   const [url, setUrl] = useState('');
   const [testing, setTesting] = useState(false);

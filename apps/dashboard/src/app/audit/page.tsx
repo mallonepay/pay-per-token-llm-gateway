@@ -1,10 +1,20 @@
 'use client';
 
-import { Shield, FileText, Loader2, RefreshCw, AlertTriangle } from 'lucide-react';
+import { Shield, FileText, RefreshCw, AlertTriangle } from 'lucide-react';
 import { useState } from 'react';
 import { useAuditLogs } from '@/lib/hooks';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { TableSkeleton } from '@/components/Skeleton';
 
 export default function AuditPage() {
+  return (
+    <ErrorBoundary>
+      <AuditPageContent />
+    </ErrorBoundary>
+  );
+}
+
+function AuditPageContent() {
   const [page, setPage] = useState(1);
   const { data, isLoading, isError, error, isFetching, refetch } = useAuditLogs({
     page,
@@ -69,9 +79,8 @@ export default function AuditPage() {
 
       <div className="card">
         {isLoading ? (
-          <div className="flex flex-col items-center justify-center py-12 gap-3">
-            <Loader2 className="w-8 h-8 text-green-400 animate-spin" />
-            <p className="text-sm text-muted-foreground">Loading audit logs...</p>
+          <div className="card">
+            <TableSkeleton rows={5} columns={4} />
           </div>
         ) : logs.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-12 gap-4">
