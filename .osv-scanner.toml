@@ -7,7 +7,7 @@
 #   (a) an advisory with no fixed release at any version, reachable only from
 #       dev/build tooling that never ships to the gateway or dashboard runtime,
 #       or
-#   (b) pinned by the Soroban SDK the on-chain contracts are compiled against.
+#   (b) pinned as transitive dependencies in the Soroban SDK 26 stack.
 #
 # `ignoreUntil` is deliberate: when an entry expires the scan starts failing
 # again, so the exception gets re-reviewed instead of aging out silently.
@@ -23,41 +23,22 @@ id = "GHSA-gcqx-w48m-w2h4"
 ignoreUntil = 2026-12-31
 reason = "deepmerge has no patched release; dev/build tooling only (webpack/rollup/jest plugins)"
 
-# ── Rust: pinned by the Soroban SDK the contracts build against ──────────────
+# ── Rust: transitive dependencies retained in Soroban SDK 26 ─────────────────
 
-# soroban-env-host / stellar-xdr are pinned by `soroban-sdk = "22"`. The fixes
-# land in soroban-env-host 26 / stellar-xdr 25, i.e. a Soroban SDK major
-# upgrade that would change the compiled wasm behind the deployed testnet
-# contracts. Deliberately held until the third-party contract audit gates
-# mainnet (MAINNET_READINESS §1); neither crate is in the gateway runtime path.
-[[IgnoredVulns]]
-id = "GHSA-pm4j-7r4q-ccg8"
-ignoreUntil = 2026-12-31
-reason = "soroban-env-host pinned by soroban-sdk 22; fix requires the held Soroban SDK 26 upgrade (MAINNET_READINESS §7)"
-
-[[IgnoredVulns]]
-id = "GHSA-x57h-xx53-v53w"
-ignoreUntil = 2026-12-31
-reason = "stellar-xdr pinned by soroban-sdk 22; fix requires the held Soroban SDK 26 upgrade (MAINNET_READINESS §7)"
-
-# Unmaintained-crate advisories (proc-macro hygiene), again soroban-env-host
-# transitive dependencies. No patched release exists for either.
-[[IgnoredVulns]]
-id = "RUSTSEC-2024-0388"
-ignoreUntil = 2026-12-31
-reason = "derivative is unmaintained with no patched release; transitive via soroban-env-host"
-
+# paste is unmaintained with no patched release; transitive via soroban-env-host
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0436"
 ignoreUntil = 2026-12-31
 reason = "paste is unmaintained with no patched release; transitive via soroban-env-host"
 
+# block-buffer 0.10.4 is transitively pulled by soroban-env-common / sha2
 [[IgnoredVulns]]
 id = "GHSA-qwgh-2vcv-g2f7"
 ignoreUntil = 2026-12-31
-reason = "block-buffer pinned by soroban-sdk 22; fix requires Soroban SDK 26 upgrade (Issue #132, MAINNET_READINESS §7)"
+reason = "block-buffer 0.10.4 has no patched release; transitive via soroban-env-host crypto stack"
 
+# crypto-bigint 0.5.5 is pinned transitively by p256/k256 in soroban-env-host
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0387"
 ignoreUntil = 2026-12-31
-reason = "crypto-bigint pinned by soroban-sdk 22; fix requires Soroban SDK 26 upgrade (Issue #132, MAINNET_READINESS §7)"
+reason = "crypto-bigint 0.5.5 pinned transitively by p256/k256 in soroban-env-host"

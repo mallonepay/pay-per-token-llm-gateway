@@ -78,7 +78,7 @@ const LEDGER_THRESHOLD: u32 = 500_000;
 const LEDGERS_TO_LIVE: u32 = 1_000_000;
 
 /// Maximum number of entries a single paginated read may return.
-const MAX_PAGE_SIZE: u32 = 100;
+const MAX_PAGE_SIZE: u32 = 50;
 
 /// Bump the TTL of the contract instance entry (config + counter) so it is
 /// never archived while the contract is in use.

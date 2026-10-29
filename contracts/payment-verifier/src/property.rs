@@ -50,7 +50,7 @@ impl Prng {
 }
 
 const ITERATIONS: usize = 200;
-const MAX_PAGE_SIZE: u32 = 100;
+const MAX_PAGE_SIZE: u32 = 50;
 
 fn setup_env() -> (Env, Address, PaymentVerifierClient<'static>) {
     let env = Env::default();

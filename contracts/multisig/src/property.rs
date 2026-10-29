@@ -49,7 +49,7 @@ impl Prng {
 }
 
 const CONFIGS: usize = 40;
-const MAX_PAGE_SIZE: u32 = 100;
+const MAX_PAGE_SIZE: u32 = 50;
 
 fn expected_page_len(offset: u32, limit: u32, count: u32) -> u32 {
     if offset >= count {

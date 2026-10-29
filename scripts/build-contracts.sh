@@ -22,14 +22,14 @@ if command -v stellar >/dev/null 2>&1; then
 else
   echo "stellar CLI not found — falling back to cargo..."
   if command -v rustup >/dev/null 2>&1; then
-    if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
-      echo "Adding wasm32-unknown-unknown target via rustup..."
-      rustup target add wasm32-unknown-unknown
+    if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32v1-none$'; then
+      echo "Adding wasm32v1-none target via rustup..."
+      rustup target add wasm32v1-none
     fi
   else
-    echo "⚠ rustup not found — assuming wasm32-unknown-unknown is already installed"
+    echo "⚠ rustup not found — assuming wasm32v1-none is already installed"
   fi
-  BUILD_CMD=(cargo build --release --target wasm32-unknown-unknown)
+  BUILD_CMD=(cargo build --release --target wasm32v1-none)
 fi
 
 for contract in "${CONTRACTS[@]}"; do

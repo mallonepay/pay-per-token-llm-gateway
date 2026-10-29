@@ -92,9 +92,9 @@ fn bench_charge_constant_cost_vs_usage_history() {
         println!(
             "  {label} → insns={} read_entries={} write_entries={} read_bytes={}B write_bytes={}B fee={} stroops",
             res.instructions,
-            res.read_entries,
+            (res.disk_read_entries + res.memory_read_entries),
             res.write_entries,
-            res.read_bytes,
+            res.disk_read_bytes,
             res.write_bytes,
             fee.total
         );
