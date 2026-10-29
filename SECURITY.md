@@ -22,6 +22,7 @@ We will respond within 48 hours and work with you on a fix.
   contracts, SDK, and dashboard (updated 2026-09-08).
 - **[`AUDIT.md`](./AUDIT.md)** — audit findings ledger with verification
   evidence.
+- **[`audits/2026-10-soroban-custody-security-audit.md`](./audits/2026-10-soroban-custody-security-audit.md)** — external security audit of `credit-escrow` and `payment-verifier` custody contracts (Issue #83).
 - **[`MAINNET_READINESS.md`](./MAINNET_READINESS.md)** — the go/no-go gate
   for a Stellar mainnet launch.
 - **[`OPERATIONS.md`](./OPERATIONS.md)** — RTO/RPO, backup/restore, disaster
@@ -225,4 +226,4 @@ mainnet go/no-go path or consciously deferred — see
 - [ ] Use separate Stellar accounts for receiving payments vs. payouts
 - [ ] Implement withdrawal limits for provider payouts
 - [ ] Fund `CONTRACT_ADMIN_SECRET`'s account with XLM and alert on low balance
-- [ ] Regular security audits of the codebase + external contract audit before mainnet
+- [x] Regular security audits of the codebase + external contract audit before mainnet (completed in [`audits/2026-10-soroban-custody-security-audit.md`](./audits/2026-10-soroban-custody-security-audit.md))
