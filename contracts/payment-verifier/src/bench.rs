@@ -79,9 +79,9 @@ fn bench_record_payment_constant_cost_vs_history() {
         println!(
             "  {label} → insns={} read_entries={} write_entries={} read_bytes={}B write_bytes={}B fee={} stroops",
             res.instructions,
-            res.read_entries,
+            (res.disk_read_entries + res.memory_read_entries),
             res.write_entries,
-            res.read_bytes,
+            res.disk_read_bytes,
             res.write_bytes,
             fee.total
         );
@@ -150,11 +150,11 @@ fn bench_get_payments_pagination_is_bounded() {
     let r = env.cost_estimate().resources();
     println!(
         "[bench] get_payments(0, u32::MAX): read_entries={} (must be <= 100 + fixed overhead)",
-        r.read_entries
+        (r.disk_read_entries + r.memory_read_entries)
     );
     assert!(
-        r.read_entries <= 110,
+        (r.disk_read_entries + r.memory_read_entries) <= 110,
         "unbounded pagination: read_entries={}",
-        r.read_entries
+        (r.disk_read_entries + r.memory_read_entries)
     );
 }
